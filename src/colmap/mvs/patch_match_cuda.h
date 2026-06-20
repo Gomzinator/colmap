@@ -37,6 +37,7 @@
 #include "colmap/mvs/image.h"
 #include "colmap/mvs/normal_map.h"
 #include "colmap/mvs/patch_match.h"
+#include "colmap/mvs/patch_match_backend.h"
 
 #include <iostream>
 #include <memory>
@@ -47,17 +48,17 @@
 namespace colmap {
 namespace mvs {
 
-class PatchMatchCuda {
+class PatchMatchCuda : public PatchMatchBackend {
  public:
   PatchMatchCuda(const PatchMatchOptions& options,
                  const PatchMatch::Problem& problem);
 
-  void Run();
+  void Run() override;
 
-  DepthMap GetDepthMap() const;
-  NormalMap GetNormalMap() const;
-  Mat<float> GetSelProbMap() const;
-  std::vector<int> GetConsistentImageIdxs() const;
+  DepthMap GetDepthMap() const override;
+  NormalMap GetNormalMap() const override;
+  Mat<float> GetSelProbMap() const override;
+  std::vector<int> GetConsistentImageIdxs() const override;
 
  private:
   template <int kWindowSize, int kWindowStep>

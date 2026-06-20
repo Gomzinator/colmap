@@ -44,6 +44,7 @@ const static size_t kMaxPatchMatchWindowRadius = 32;
 
 void PatchMatchOptions::Print() const {
   LOG_HEADING2("PatchMatchOptions");
+  PrintOption(backend);
   PrintOption(max_image_size);
   PrintOption(gpu_index);
   PrintOption(depth_min);
@@ -71,6 +72,7 @@ void PatchMatchOptions::Print() const {
 }
 
 bool PatchMatchOptions::Check() const {
+  CHECK_OPTION(backend == "auto" || backend == "cuda" || backend == "cpu");
   if (depth_min != -1.0f || depth_max != -1.0f) {
     CHECK_OPTION_LE(depth_min, depth_max);
     CHECK_OPTION_GE(depth_min, 0.0f);

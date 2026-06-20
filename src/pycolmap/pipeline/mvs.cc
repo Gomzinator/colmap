@@ -27,6 +27,9 @@ void BindMVS(py::module& m) {
   auto PyPatchMatchOptions =
       py::classh<PMOpts>(m, "PatchMatchOptions")
           .def(py::init<>())
+          .def_readwrite("backend",
+                         &PMOpts::backend,
+                         "Compute backend: 'auto', 'cuda', or 'cpu'.")
           .def_readwrite("max_image_size",
                          &PMOpts::max_image_size,
                          "Maximum image size in either dimension.")
@@ -123,7 +126,8 @@ void BindMVS(py::module& m) {
         "pmvs_option_name"_a = "option-all",
         py::arg_v("options", mvs::PatchMatchOptions(), "PatchMatchOptions()"),
         "config_path"_a = "",
-        "Runs Patch-Match-Stereo (requires CUDA)",
+        "Runs Patch-Match-Stereo (uses CUDA if available, otherwise "
+        "falls back to a slower CPU implementation)",
         py::call_guard<py::gil_scoped_release>());
 
   using SFOpts = mvs::StereoFusionOptions;

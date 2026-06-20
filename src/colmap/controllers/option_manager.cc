@@ -885,6 +885,7 @@ void OptionManager::AddPatchMatchStereoOptions() {
   }
   added_patch_match_stereo_options_ = true;
 
+  AddDefaultOption("PatchMatchStereo.backend", &patch_match_stereo->backend);
   AddDefaultOption("PatchMatchStereo.max_image_size",
                    &patch_match_stereo->max_image_size);
   AddDefaultOption("PatchMatchStereo.gpu_index",

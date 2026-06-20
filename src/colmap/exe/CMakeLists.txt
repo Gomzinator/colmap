@@ -37,9 +37,6 @@ endif()
 set(OPTIONAL_LIBS)
 if(CUDA_ENABLED)
     list(APPEND OPTIONAL_LIBS colmap_util_cuda)
-    if(MVS_ENABLED)
-        list(APPEND OPTIONAL_LIBS colmap_mvs_cuda)
-    endif()
 endif()
 if(GUI_ENABLED)
     list(APPEND OPTIONAL_LIBS
@@ -63,7 +60,7 @@ set(COLMAP_EXE_PUBLIC_LIBS
 )
 if(MVS_ENABLED)
     list(APPEND COLMAP_EXE_SRCS mvs.h mvs.cc)
-    list(APPEND COLMAP_EXE_PUBLIC_LIBS colmap_mvs)
+    list(APPEND COLMAP_EXE_PUBLIC_LIBS colmap_mvs colmap_mvs_patch_match)
 endif()
 
 COLMAP_ADD_LIBRARY(

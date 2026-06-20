@@ -35,6 +35,11 @@ namespace colmap {
 namespace mvs {
 
 struct PatchMatchOptions {
+  // Compute backend: "auto" selects CUDA if compiled in and a device is
+  // available, otherwise falls back to the (much slower) CPU backend.
+  // "cuda" and "cpu" force the respective backend.
+  std::string backend = "auto";
+
   // Depth range in which to randomly sample depth hypotheses.
   double depth_min = -1.0f;
   double depth_max = -1.0f;

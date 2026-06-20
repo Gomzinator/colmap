@@ -46,12 +46,14 @@ namespace colmap {
 namespace mvs {
 
 class ConsistencyGraph;
-class PatchMatchCuda;
+class PatchMatchBackend;
 class Workspace;
 
-// This is a wrapper class around the actual PatchMatchCuda implementation. This
-// class is necessary to hide Cuda code from any boost or Eigen code, since
-// NVCC/MSVC cannot compile complex C++ code.
+// This is a wrapper class around the actual PatchMatch backend
+// implementations (CUDA or CPU). The backend is selected at runtime via
+// PatchMatchOptions::backend. This class is also necessary to hide Cuda code
+// from any boost or Eigen code, since NVCC/MSVC cannot compile complex C++
+// code.
 class PatchMatch {
  public:
   struct Problem {
@@ -92,7 +94,7 @@ class PatchMatch {
  private:
   const PatchMatchOptions options_;
   const Problem problem_;
-  std::unique_ptr<PatchMatchCuda> patch_match_cuda_;
+  std::unique_ptr<PatchMatchBackend> backend_;
 };
 
 // This thread processes all problems in a workspace. A workspace has the
@@ -154,6 +156,8 @@ class PatchMatchController : public BaseController {
   std::vector<PatchMatch::Problem> problems_;
   std::vector<int> gpu_indices_;
   std::vector<std::pair<float, float>> depth_ranges_;
+  // Backend resolved once for all problems ("cuda" or "cpu").
+  std::string resolved_backend_;
 };
 
 #endif

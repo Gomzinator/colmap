@@ -31,12 +31,18 @@
 
 #include "colmap/math/math.h"
 #include "colmap/mvs/consistency_graph.h"
-#include "colmap/mvs/patch_match_cuda.h"
+#include "colmap/mvs/patch_match_backend.h"
+#include "colmap/mvs/patch_match_cpu.h"
 #include "colmap/mvs/workspace.h"
-#include "colmap/util/cuda.h"
 #include "colmap/util/file.h"
 #include "colmap/util/misc.h"
+#include "colmap/util/string.h"
 #include "colmap/util/threading.h"
+
+#if defined(COLMAP_CUDA_ENABLED)
+#include "colmap/mvs/patch_match_cuda.h"
+#include "colmap/util/cuda.h"
+#endif
 
 #include <numeric>
 #include <set>
@@ -51,6 +57,31 @@ PatchMatch::PatchMatch(const PatchMatchOptions& options, const Problem& problem)
     : options_(options), problem_(problem) {}
 
 PatchMatch::~PatchMatch() {}
+
+PatchMatchBackendType ResolvePatchMatchBackend(const std::string& backend) {
+  std::string backend_lower_case = backend;
+  StringToLower(&backend_lower_case);
+  if (backend_lower_case == "cuda") {
+#if defined(COLMAP_CUDA_ENABLED)
+    return PatchMatchBackendType::kCuda;
+#else
+    LOG(FATAL_THROW) << "PatchMatchStereo.backend is set to 'cuda', but "
+                        "COLMAP was compiled without CUDA support.";
+#endif
+  } else if (backend_lower_case == "cpu") {
+    return PatchMatchBackendType::kCpu;
+  } else if (backend_lower_case == "auto") {
+#if defined(COLMAP_CUDA_ENABLED)
+    if (GetNumCudaDevices() > 0) {
+      return PatchMatchBackendType::kCuda;
+    }
+#endif
+    return PatchMatchBackendType::kCpu;
+  }
+  LOG(FATAL_THROW) << "Invalid PatchMatchStereo.backend: '" << backend
+                   << "'. Valid values are {auto, cuda, cpu}.";
+  return PatchMatchBackendType::kCpu;
+}
 
 void PatchMatch::Problem::Print() const {
   LOG_HEADING2("PatchMatch::Problem");
@@ -130,27 +161,35 @@ void PatchMatch::Run() {
 
   Check();
 
-  patch_match_cuda_ = std::make_unique<PatchMatchCuda>(options_, problem_);
-  patch_match_cuda_->Run();
+  switch (ResolvePatchMatchBackend(options_.backend)) {
+    case PatchMatchBackendType::kCuda:
+#if defined(COLMAP_CUDA_ENABLED)
+      backend_ = std::make_unique<PatchMatchCuda>(options_, problem_);
+      break;
+#else
+      LOG(FATAL_THROW)
+          << "CUDA backend requested, but COLMAP was compiled without CUDA.";
+#endif
+    case PatchMatchBackendType::kCpu:
+      backend_ = std::make_unique<PatchMatchCpu>(options_, problem_);
+      break;
+  }
+  backend_->Run();
 }
 
-DepthMap PatchMatch::GetDepthMap() const {
-  return patch_match_cuda_->GetDepthMap();
-}
+DepthMap PatchMatch::GetDepthMap() const { return backend_->GetDepthMap(); }
 
-NormalMap PatchMatch::GetNormalMap() const {
-  return patch_match_cuda_->GetNormalMap();
-}
+NormalMap PatchMatch::GetNormalMap() const { return backend_->GetNormalMap(); }
 
 Mat<float> PatchMatch::GetSelProbMap() const {
-  return patch_match_cuda_->GetSelProbMap();
+  return backend_->GetSelProbMap();
 }
 
 ConsistencyGraph PatchMatch::GetConsistencyGraph() const {
   const auto& ref_image = problem_.images->at(problem_.ref_image_idx);
   return ConsistencyGraph(ref_image.GetWidth(),
                           ref_image.GetHeight(),
-                          patch_match_cuda_->GetConsistentImageIdxs());
+                          backend_->GetConsistentImageIdxs());
 }
 
 PatchMatchController::PatchMatchController(
@@ -373,12 +412,28 @@ void PatchMatchController::ReadProblems() {
 }
 
 void PatchMatchController::ReadGpuIndices() {
+  if (ResolvePatchMatchBackend(options_.backend) ==
+      PatchMatchBackendType::kCpu) {
+    resolved_backend_ = "cpu";
+    // The CPU backend parallelizes internally over image columns, so a
+    // single worker processes one problem at a time.
+    gpu_indices_ = {-1};
+    LOG(WARNING)
+        << "Running patch match stereo on the CPU. This is one to two "
+           "orders of magnitude slower than the CUDA backend. Consider "
+           "reducing --PatchMatchStereo.max_image_size and/or setting "
+           "--PatchMatchStereo.window_step 2 to speed up the computation.";
+    return;
+  }
+  resolved_backend_ = "cuda";
   gpu_indices_ = CSVToVector<int>(options_.gpu_index);
   if (gpu_indices_.size() == 1 && gpu_indices_[0] == -1) {
+#if defined(COLMAP_CUDA_ENABLED)
     const int num_cuda_devices = GetNumCudaDevices();
     THROW_CHECK_GT(num_cuda_devices, 0);
     gpu_indices_.resize(num_cuda_devices);
     std::iota(gpu_indices_.begin(), gpu_indices_.end(), 0);
+#endif
   }
 }
 
@@ -432,6 +487,7 @@ void PatchMatchController::ProcessProblem(const PatchMatchOptions& options,
   }
 
   patch_match_options.gpu_index = std::to_string(gpu_index);
+  patch_match_options.backend = resolved_backend_;
 
   if (patch_match_options.sigma_spatial <= 0.0f) {
     patch_match_options.sigma_spatial = patch_match_options.window_radius;

@@ -392,7 +392,7 @@ void DenseReconstructionWidget::Stereo() {
     return;
   }
 
-#if defined(COLMAP_MVS_ENABLED) && defined(COLMAP_CUDA_ENABLED)
+#if defined(COLMAP_MVS_ENABLED)
   auto processor =
       std::make_unique<ControllerThread<mvs::PatchMatchController>>(
           std::make_shared<mvs::PatchMatchController>(
@@ -400,16 +400,11 @@ void DenseReconstructionWidget::Stereo() {
   processor->AddCallback(Thread::FINISHED_CALLBACK,
                          [this]() { refresh_workspace_action_->trigger(); });
   thread_control_widget_->StartThread("Stereo...", true, std::move(processor));
-#elif !defined(COLMAP_MVS_ENABLED)
+#else
   QMessageBox::critical(this,
                         "",
                         tr("Dense stereo reconstruction requires the MVS "
                            "module, which is not available in this build."));
-#else
-  QMessageBox::critical(this,
-                        "",
-                        tr("Dense stereo reconstruction requires CUDA, which "
-                           "is not available on your system."));
 #endif
 }
 

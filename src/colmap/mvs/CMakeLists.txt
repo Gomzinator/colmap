@@ -44,6 +44,8 @@ COLMAP_ADD_LIBRARY(
         model.h model.cc
         poisson_meshing.h poisson_meshing.cc
         normal_map.h normal_map.cc
+        patch_match_backend.h
+        patch_match_cpu.h patch_match_cpu.cc
         patch_match_options.h patch_match_options.cc
         texture_mapping.h texture_mapping.cc
         workspace.h workspace.cc
@@ -136,7 +138,6 @@ if(CUDA_ENABLED)
         SRCS
             gpu_mat_prng.h gpu_mat_prng.cu
             gpu_mat_ref_image.h gpu_mat_ref_image.cu
-            patch_match.h patch_match.cc
             patch_match_cuda.h patch_match_cuda.cu
         PUBLIC_LINK_LIBS
             colmap_mvs
@@ -279,5 +280,25 @@ if(CUDA_ENABLED)
         NAME gpu_mat_test
         SRCS gpu_mat_test.cu
         LINK_LIBS colmap_mvs_cuda
+    )
+endif()
+
+# PatchMatch wrapper, controller, and backend factory. Built unconditionally;
+# links the CUDA backend only when available. This breaks the previous
+# situation where the (CUDA-independent) controller was only compiled with
+# CUDA support.
+COLMAP_ADD_LIBRARY(
+    NAME colmap_mvs_patch_match
+    SRCS
+        patch_match.h patch_match.cc
+    PUBLIC_LINK_LIBS
+        colmap_mvs
+    PRIVATE_LINK_LIBS
+        colmap_math
+)
+if(CUDA_ENABLED)
+    target_link_libraries(colmap_mvs_patch_match PRIVATE
+        colmap_mvs_cuda
+        colmap_util_cuda
     )
 endif()

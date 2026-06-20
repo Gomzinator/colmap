@@ -67,13 +67,13 @@ COLMAP_ADD_LIBRARY(
         faiss
 )
 if(MVS_ENABLED)
-    target_link_libraries(colmap_controllers PRIVATE colmap_mvs)
+    target_link_libraries(colmap_controllers PRIVATE
+        colmap_mvs
+        colmap_mvs_patch_match
+    )
 endif()
 if(CUDA_ENABLED)
     target_link_libraries(colmap_controllers PRIVATE colmap_util_cuda)
-    if(MVS_ENABLED)
-        target_link_libraries(colmap_controllers PRIVATE colmap_mvs_cuda)
-    endif()
 endif()
 
 COLMAP_ADD_TEST(
