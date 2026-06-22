@@ -427,7 +427,7 @@ set(COLMAP_EXPORT_LIBS
     colmap_vlfeat
 )
 if(MVS_ENABLED)
-    list(APPEND COLMAP_EXPORT_LIBS colmap_mvs)
+    list(APPEND COLMAP_EXPORT_LIBS colmap_mvs colmap_mvs_patch_match)
 endif()
 if(LSD_ENABLED)
     list(APPEND COLMAP_EXPORT_LIBS
