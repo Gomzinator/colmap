@@ -290,6 +290,7 @@ if(OPENCL_ENABLED)
         NAME colmap_mvs_opencl
         SRCS
             patch_match_opencl.h patch_match_opencl.cc
+            patch_match_opencl_kernels.h
         PUBLIC_LINK_LIBS
             colmap_mvs
             OpenCL::OpenCL
