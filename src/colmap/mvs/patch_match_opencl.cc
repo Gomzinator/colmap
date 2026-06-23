@@ -322,6 +322,35 @@ PatchMatchOpenCL::PatchMatchOpenCL(const PatchMatchOptions& options,
                         "image count.";
   }
 
+  // The Adreno silently mis-addresses single buffers above ~32 MB (despite
+  // reporting a 1 GB CL_DEVICE_MAX_MEM_ALLOC_SIZE), producing garbage depth maps
+  // with no error. The per-source maps (cost / sel_prob / scratch) are
+  // num_src * width * height * 4 bytes; refuse to run (loud error) rather than
+  // silently produce wrong results when that exceeds a safe limit. The limit is
+  // conservative (600px @ 20 sources = 21.6 MB is validated good; 800px @ 20 =
+  // 38 MB is garbage) and overridable for experimentation.
+  const size_t plane =
+      static_cast<size_t>(ref_width_) * static_cast<size_t>(ref_height_);
+  const size_t per_src_buf_bytes =
+      static_cast<size_t>(num_src_) * plane * sizeof(float);
+  size_t max_buf_mb = 24;
+  if (const char* e = std::getenv("COLMAP_OPENCL_MAX_BUFFER_MB")) {
+    const long v = std::atol(e);
+    if (v > 0) max_buf_mb = static_cast<size_t>(v);
+  }
+  if (per_src_buf_bytes > max_buf_mb * 1024 * 1024) {
+    LOG(FATAL_THROW)
+        << "OpenCL backend: per-source map buffer is "
+        << (per_src_buf_bytes >> 20) << " MB (num_src=" << num_src_ << " x "
+        << ref_width_ << "x" << ref_height_
+        << "), exceeding the safe ~" << max_buf_mb
+        << " MB Adreno single-buffer addressing limit. Above it the GPU "
+           "silently mis-addresses the buffer and produces garbage. Reduce "
+           "--PatchMatchStereo.max_image_size or the number of source images "
+           "(__auto__,N), use --PatchMatchStereo.backend cpu for full "
+           "resolution, or raise COLMAP_OPENCL_MAX_BUFFER_MB to experiment.";
+  }
+
   InitDevice();
   BuildProgram();
   InitHostDataAndUpload();
@@ -770,9 +799,12 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
   cmask_buf_ = CreateBuffer(
       context_, rw, static_cast<size_t>(num_src_) * plane * sizeof(uint8_t),
       nullptr);
-  scratch_buf_ = CreateBuffer(
-      context_, rw, static_cast<size_t>(num_src_) * plane * sizeof(float),
-      nullptr);
+  // Rotation scratch must hold the largest rotated map: num_src float channels
+  // (cost/sel) OR the ulong2 PRNG map (2*8 bytes/pixel) OR 3 normal channels.
+  const size_t scratch_bytes =
+      plane * std::max<size_t>(static_cast<size_t>(num_src_) * sizeof(float),
+                               2 * sizeof(cl_ulong));
+  scratch_buf_ = CreateBuffer(context_, rw, scratch_bytes, nullptr);
   src_images_buf_ = CreateBuffer(context_, ro_copy, src_images_host.size(),
                                  src_images_host.data());
   const size_t src_depth_bytes =
