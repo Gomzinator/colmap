@@ -192,6 +192,34 @@ void SetArg(cl_kernel kernel, cl_uint index, size_t size, const void* value) {
   CheckCL(clSetKernelArg(kernel, index, size, value), "clSetKernelArg");
 }
 
+// Enqueue a 2D kernel over a (w x h) domain with an EXPLICIT local work-group
+// size and the global size padded up to a multiple of it. The kernels bounds-
+// check (col>=w || row>=h => return), so padded work-items are no-ops. This
+// avoids relying on the driver's local-size choice for a NULL local, which on
+// the Adreno silently drops work-items for awkward dimensions (e.g. height 598)
+// and corrupts the maps.
+void Enqueue2D(cl_command_queue queue,
+               cl_device_id device,
+               cl_kernel kernel,
+               int w,
+               int h,
+               const std::string& what) {
+  size_t kernel_wg = 0;
+  CheckCL(clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE,
+                                   sizeof(size_t), &kernel_wg, nullptr),
+          "clGetKernelWorkGroupInfo");
+  size_t l = 16;
+  while (l > 1 && l * l > kernel_wg) {
+    l /= 2;
+  }
+  const size_t lws[2] = {l, l};
+  const size_t gws[2] = {((static_cast<size_t>(w) + l - 1) / l) * l,
+                         ((static_cast<size_t>(h) + l - 1) / l) * l};
+  CheckCL(clEnqueueNDRangeKernel(queue, kernel, 2, nullptr, gws, lws, 0, nullptr,
+                                 nullptr),
+          what);
+}
+
 cl_mem CreateBuffer(cl_context context,
                     cl_mem_flags flags,
                     size_t bytes,
@@ -784,12 +812,9 @@ void PatchMatchOpenCL::RotateMaps(bool rotate_cmask) {
   const int iw = cur_width_;
   const int ih = cur_height_;
   const size_t plane = static_cast<size_t>(iw) * ih;
-  const size_t gws[2] = {static_cast<size_t>(iw), static_cast<size_t>(ih)};
 
   auto run2d = [&](cl_kernel kernel) {
-    CheckCL(clEnqueueNDRangeKernel(queue_, kernel, 2, nullptr, gws, nullptr, 0,
-                                   nullptr, nullptr),
-            "clEnqueueNDRangeKernel(rotate)");
+    Enqueue2D(queue_, device_, kernel, iw, ih, "clEnqueueNDRangeKernel(rotate)");
   };
   auto copy_back = [&](cl_mem dst, size_t bytes) {
     CheckCL(clEnqueueCopyBuffer(queue_, scratch_buf_, dst, 0, 0, bytes, 0,
@@ -1072,11 +1097,8 @@ void PatchMatchOpenCL::Run() {
     SetArg(k_initial_cost_, a++, sizeof(int), &window_radius_);
     SetArg(k_initial_cost_, a++, sizeof(int), &window_step_);
     SetArg(k_initial_cost_, a++, sizeof(int), &rotation_);
-    const size_t gws[2] = {static_cast<size_t>(cur_width_),
-                           static_cast<size_t>(cur_height_)};
-    CheckCL(clEnqueueNDRangeKernel(queue_, k_initial_cost_, 2, nullptr, gws,
-                                   nullptr, 0, nullptr, nullptr),
-            "clEnqueueNDRangeKernel(compute_initial_cost)");
+    Enqueue2D(queue_, device_, k_initial_cost_, cur_width_, cur_height_,
+              "clEnqueueNDRangeKernel(compute_initial_cost)");
     CheckCL(clFinish(queue_), "clFinish(initial_cost)");
   }
 
