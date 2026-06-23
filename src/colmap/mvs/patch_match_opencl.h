@@ -150,8 +150,10 @@ class PatchMatchOpenCL : public PatchMatchBackend {
   cl_mem cmask_buf_ = nullptr;          // uchar num_src*W*H
   cl_mem scratch_buf_ = nullptr;        // generic rotation scratch (>= num_src*W*H floats)
   cl_mem src_images_buf_ = nullptr;     // uchar src_max_w*src_max_h*num_src
+  cl_mem src_depth_buf_ = nullptr;      // float src_max_w*src_max_h*num_src (geom)
   cl_mem poses_buf_ = nullptr;          // float 4*num_src*43
   cl_mem ref_inv_K_buf_ = nullptr;      // float 16
+  cl_mem ref_K_buf_ = nullptr;          // float 16 (geom)
   cl_mem bilateral_spatial_buf_ = nullptr;
   cl_mem bilateral_color_buf_ = nullptr;
 

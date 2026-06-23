@@ -232,14 +232,6 @@ void GenRandNormal(int row,
 PatchMatchOpenCL::PatchMatchOpenCL(const PatchMatchOptions& options,
                                    const PatchMatch::Problem& problem)
     : options_(options), problem_(problem) {
-  if (options_.geom_consistency) {
-    LOG(FATAL_THROW)
-        << "The OpenCL backend does not yet support geometric consistency "
-           "(Phase 2c). Run the photometric pass with "
-           "--PatchMatchStereo.geom_consistency false, or use "
-           "--PatchMatchStereo.backend cpu.";
-  }
-
   const Image& ref_image = problem_.images->at(problem_.ref_image_idx);
   ref_width_ = static_cast<int>(ref_image.GetWidth());
   ref_height_ = static_cast<int>(ref_image.GetHeight());
@@ -267,8 +259,8 @@ PatchMatchOpenCL::~PatchMatchOpenCL() {
       depth_buf_,        normal_buf_,    ref_img_buf_,       ref_sum_buf_,
       ref_sqsum_buf_,    cost_buf_,      rand_buf_,          sel_prob_buf_,
       prev_sel_prob_buf_, cmask_buf_,    scratch_buf_,       src_images_buf_,
-      poses_buf_,        ref_inv_K_buf_, bilateral_spatial_buf_,
-      bilateral_color_buf_};
+      src_depth_buf_,    poses_buf_,     ref_inv_K_buf_,     ref_K_buf_,
+      bilateral_spatial_buf_, bilateral_color_buf_};
   for (cl_mem buf : buffers) {
     if (buf != nullptr) clReleaseMemObject(buf);
   }
@@ -496,6 +488,23 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
     }
   }
 
+  // Source depth maps for the geometric-consistency term (layer-major,
+  // zero-padded), mirroring PatchMatchCpu::InitSourceImages.
+  std::vector<float> src_depth_host;
+  if (options_.geom_consistency) {
+    src_depth_host.assign(static_cast<size_t>(max_w) * max_h * num_src_, 0.0f);
+    for (int i = 0; i < num_src_; ++i) {
+      const DepthMap& dm = problem_.depth_maps->at(problem_.src_image_idxs[i]);
+      float* dest =
+          src_depth_host.data() + static_cast<size_t>(max_w) * max_h * i;
+      for (int r = 0; r < static_cast<int>(dm.GetHeight()); ++r) {
+        std::memcpy(dest + static_cast<size_t>(r) * max_w,
+                    dm.GetPtr() + static_cast<size_t>(r) * dm.GetWidth(),
+                    dm.GetWidth() * sizeof(float));
+      }
+    }
+  }
+
   //////////////////////////////////////////////////////////////////////////////
   // Transforms: per-rotation reference calibration and source poses
   // (mirror PatchMatchCpu::InitTransforms).
@@ -564,9 +573,11 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
   }
 
   std::vector<float> ref_inv_K_flat(16);
+  std::vector<float> ref_K_flat(16);
   for (int i = 0; i < 4; ++i) {
     for (int j = 0; j < 4; ++j) {
       ref_inv_K_flat[i * 4 + j] = ref_inv_K_host_[i][j];
+      ref_K_flat[i * 4 + j] = ref_K_host_[i][j];
     }
   }
 
@@ -578,20 +589,42 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
   std::vector<float> depth_host(static_cast<size_t>(W) * H);
   std::vector<float> normal_host(static_cast<size_t>(3) * W * H);
   const size_t plane = static_cast<size_t>(W) * H;
-  for (int row = 0; row < H; ++row) {
-    for (int col = 0; col < W; ++col) {
-      const size_t idx = static_cast<size_t>(row) * W + col;
-      HostPcg32 st;
-      SeedPcg32(idx, &st);
-      depth_host[idx] =
-          GenRandDepth(options_.depth_min, options_.depth_max, &st);
-      float normal[3];
-      GenRandNormal(row, col, ref_inv_K_host_[0], &st, normal);
-      normal_host[0 * plane + idx] = normal[0];
-      normal_host[1 * plane + idx] = normal[1];
-      normal_host[2 * plane + idx] = normal[2];
-      rand_host[2 * idx + 0] = st.state;
-      rand_host[2 * idx + 1] = st.inc;
+  if (options_.geom_consistency) {
+    // Geometric pass: initialize depth/normal from the photometric maps (loaded
+    // by the controller) and seed the PRNG states without consuming them, like
+    // PatchMatchCpu::InitWorkspaceMemory.
+    const DepthMap& init_depth =
+        problem_.depth_maps->at(problem_.ref_image_idx);
+    const NormalMap& init_normal =
+        problem_.normal_maps->at(problem_.ref_image_idx);
+    std::memcpy(depth_host.data(), init_depth.GetPtr(), plane * sizeof(float));
+    std::memcpy(normal_host.data(), init_normal.GetPtr(),
+                3 * plane * sizeof(float));
+    for (int row = 0; row < H; ++row) {
+      for (int col = 0; col < W; ++col) {
+        const size_t idx = static_cast<size_t>(row) * W + col;
+        HostPcg32 st;
+        SeedPcg32(idx, &st);
+        rand_host[2 * idx + 0] = st.state;
+        rand_host[2 * idx + 1] = st.inc;
+      }
+    }
+  } else {
+    for (int row = 0; row < H; ++row) {
+      for (int col = 0; col < W; ++col) {
+        const size_t idx = static_cast<size_t>(row) * W + col;
+        HostPcg32 st;
+        SeedPcg32(idx, &st);
+        depth_host[idx] =
+            GenRandDepth(options_.depth_min, options_.depth_max, &st);
+        float normal[3];
+        GenRandNormal(row, col, ref_inv_K_host_[0], &st, normal);
+        normal_host[0 * plane + idx] = normal[0];
+        normal_host[1 * plane + idx] = normal[1];
+        normal_host[2 * plane + idx] = normal[2];
+        rand_host[2 * idx + 0] = st.state;
+        rand_host[2 * idx + 1] = st.inc;
+      }
     }
   }
 
@@ -631,10 +664,23 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
       nullptr);
   src_images_buf_ = CreateBuffer(context_, ro_copy, src_images_host.size(),
                                  src_images_host.data());
+  const size_t src_depth_bytes =
+      static_cast<size_t>(src_max_w_) * src_max_h_ * num_src_ * sizeof(float);
+  if (options_.geom_consistency) {
+    src_depth_buf_ = CreateBuffer(context_, ro_copy,
+                                  src_depth_host.size() * sizeof(float),
+                                  src_depth_host.data());
+  } else {
+    // Allocated but unused in the photometric pass (kernel arg must be valid).
+    src_depth_buf_ =
+        CreateBuffer(context_, CL_MEM_READ_ONLY, src_depth_bytes, nullptr);
+  }
   poses_buf_ = CreateBuffer(context_, ro_copy, poses_host.size() * sizeof(float),
                             poses_host.data());
   ref_inv_K_buf_ = CreateBuffer(context_, ro_copy, 16 * sizeof(float),
                                 ref_inv_K_flat.data());
+  ref_K_buf_ = CreateBuffer(context_, ro_copy, 16 * sizeof(float),
+                            ref_K_flat.data());
   bilateral_spatial_buf_ = CreateBuffer(
       context_, ro_copy, bilateral_spatial.size() * sizeof(float),
       bilateral_spatial.data());
@@ -756,6 +802,13 @@ void PatchMatchOpenCL::RunSweeps() {
   const int filter_min_num_consistent = options_.filter_min_num_consistent;
   const int num_samples = options_.num_samples;
 
+  // Geometric-consistency term (Phase 2c). Active for every sweep of the
+  // geometric pass; the geometric filter additionally runs on the last sweep.
+  const int geom_consistency_term = options_.geom_consistency ? 1 : 0;
+  const float geom_regularizer = options_.geom_consistency_regularizer;
+  const float geom_max_cost = options_.geom_consistency_max_cost;
+  const float filter_geom_max_cost = options_.filter_geom_consistency_max_cost;
+
   const float total_num_steps = options_.num_iterations * 4.0f;
 
   for (int iter = 0; iter < options_.num_iterations; ++iter) {
@@ -769,6 +822,8 @@ void PatchMatchOpenCL::RunSweeps() {
       const bool last_sweep =
           iter == options_.num_iterations - 1 && sweep == 3;
       const int filter_photo = (last_sweep && options_.filter) ? 1 : 0;
+      const int filter_geom =
+          (last_sweep && options_.filter && options_.geom_consistency) ? 1 : 0;
 
       if (filter_photo) {
         const uint8_t zero = 0;
@@ -816,6 +871,13 @@ void PatchMatchOpenCL::RunSweeps() {
       SetArg(k_sweep_, a++, sizeof(float), &filter_min_ncc_prob);
       SetArg(k_sweep_, a++, sizeof(float), &filter_cos_min_tri);
       SetArg(k_sweep_, a++, sizeof(int), &filter_min_num_consistent);
+      SetArg(k_sweep_, a++, sizeof(cl_mem), &src_depth_buf_);
+      SetArg(k_sweep_, a++, sizeof(cl_mem), &ref_K_buf_);
+      SetArg(k_sweep_, a++, sizeof(int), &geom_consistency_term);
+      SetArg(k_sweep_, a++, sizeof(float), &geom_regularizer);
+      SetArg(k_sweep_, a++, sizeof(float), &geom_max_cost);
+      SetArg(k_sweep_, a++, sizeof(int), &filter_geom);
+      SetArg(k_sweep_, a++, sizeof(float), &filter_geom_max_cost);
 
       // Column-banded launches (Windows TDR watchdog).
       for (int c0 = 0; c0 < cur_width_; c0 += kSweepColumnBand) {
@@ -873,8 +935,9 @@ void PatchMatchOpenCL::ReadbackResults() {
 void PatchMatchOpenCL::Run() {
   Timer total_timer;
   total_timer.Start();
-  LOG(INFO) << "Running PatchMatch stereo (photometric) on the GPU via OpenCL "
-               "with "
+  LOG(INFO) << "Running PatchMatch stereo ("
+            << (options_.geom_consistency ? "geometric" : "photometric")
+            << ") on the GPU via OpenCL with "
             << GetDeviceInfoString(device_, CL_DEVICE_NAME);
 
   // Initial cost (2D grid over the reference image, rotation 0).

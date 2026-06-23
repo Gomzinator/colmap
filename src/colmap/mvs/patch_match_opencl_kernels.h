@@ -422,6 +422,73 @@ void compute_viewing_angles(__global const float* pose,
   *cos_triangulation_angle = -dot3(SX, point) * RX_inv_norm * SX_inv_norm;
 }
 
+// Source depth maps: nearest-neighbor sampling, border addressing (0 outside =
+// invalid depth). Equivalent to tex2DLayered point sampling at (x+0.5, y+0.5).
+float sample_src_depth_nearest(__global const float* src_depths,
+                               int image_idx,
+                               int src_max_w,
+                               int src_max_h,
+                               float x,
+                               float y) {
+  const int xi = (int)floor(x + 0.5f);
+  const int yi = (int)floor(y + 0.5f);
+  if (xi < 0 || yi < 0 || xi >= src_max_w || yi >= src_max_h) {
+    return 0.0f;
+  }
+  return src_depths[(size_t)image_idx * src_max_w * src_max_h +
+                    (size_t)yi * src_max_w + xi];
+}
+
+// Geometric-consistency cost: forward-backward reprojection error in pixels
+// (verbatim port of PatchMatchCpu::ComputeGeomConsistencyCost). pose layout:
+// P(12) at offset 19, inv_P(12) at offset 31.
+float compute_geom_consistency_cost(__global const float* pose,
+                                    const float* ref_K,
+                                    const float* ref_inv_K,
+                                    __global const float* src_depths,
+                                    int src_max_w,
+                                    int src_max_h,
+                                    int row,
+                                    int col,
+                                    float depth,
+                                    int image_idx,
+                                    float max_cost) {
+  __global const float* P = pose + 19;
+  __global const float* inv_P = pose + 31;
+
+  float fwd[3];
+  compute_point_at_depth((float)row, (float)col, ref_inv_K, depth, fwd);
+
+  const float inv_fwd_z =
+      1.0f / (P[8] * fwd[0] + P[9] * fwd[1] + P[10] * fwd[2] + P[11]);
+  float src_col =
+      inv_fwd_z * (P[0] * fwd[0] + P[1] * fwd[1] + P[2] * fwd[2] + P[3]);
+  float src_row =
+      inv_fwd_z * (P[4] * fwd[0] + P[5] * fwd[1] + P[6] * fwd[2] + P[7]);
+
+  const float src_depth =
+      sample_src_depth_nearest(src_depths, image_idx, src_max_w, src_max_h,
+                               src_col, src_row);
+  if (src_depth == 0.0f) {
+    return max_cost;
+  }
+
+  src_col *= src_depth;
+  src_row *= src_depth;
+  const float bx =
+      inv_P[0] * src_col + inv_P[1] * src_row + inv_P[2] * src_depth + inv_P[3];
+  const float by =
+      inv_P[4] * src_col + inv_P[5] * src_row + inv_P[6] * src_depth + inv_P[7];
+  const float bz =
+      inv_P[8] * src_col + inv_P[9] * src_row + inv_P[10] * src_depth + inv_P[11];
+  const float inv_bz = 1.0f / bz;
+  const float back_col = inv_bz * (ref_K[0] * bx + ref_K[1] * bz);
+  const float back_row = inv_bz * (ref_K[2] * by + ref_K[3] * bz);
+  const float dcol = col - back_col;
+  const float drow = row - back_row;
+  return fmin(max_cost, sqrt(dcol * dcol + drow * drow));
+}
+
 // Bilaterally weighted NCC photo-consistency cost (verbatim port, with the
 // incremental warp accumulation to limit numerical error).
 float compute_photo_consistency_cost(__global const uchar* ref_image,
@@ -589,8 +656,9 @@ __kernel void compute_initial_cost(__global const float* depth_map,
 
 // ===========================================================================
 // Kernel: sweep from top to bottom (one work-item per column).
-// Photometric only (no geometric-consistency term). The photometric filter
-// runs when filter_photo != 0 (last sweep).
+// Photometric cost, plus an optional geometric-consistency term when
+// geom_consistency_term != 0 (Phase 2c). The photometric and/or geometric
+// filter runs on the last sweep (filter_photo / filter_geom).
 // ===========================================================================
 __kernel void sweep(__global float* depth_map,
                     __global float* normal_map,
@@ -625,7 +693,14 @@ __kernel void sweep(__global float* depth_map,
                     int filter_photo,
                     float filter_min_ncc_prob,
                     float filter_cos_min_triangulation_angle,
-                    int filter_min_num_consistent) {
+                    int filter_min_num_consistent,
+                    __global const float* src_depths,
+                    __global const float* ref_K_all,
+                    int geom_consistency_term,
+                    float geom_regularizer,
+                    float geom_max_cost,
+                    int filter_geom,
+                    float filter_geom_max_cost) {
   const int col = get_global_id(0);
   if (col >= width) {
     return;
@@ -638,6 +713,12 @@ __kernel void sweep(__global float* depth_map,
   ref_inv_K[1] = ref_inv_K_all[rotation * 4 + 1];
   ref_inv_K[2] = ref_inv_K_all[rotation * 4 + 2];
   ref_inv_K[3] = ref_inv_K_all[rotation * 4 + 3];
+
+  float ref_K[4];
+  ref_K[0] = ref_K_all[rotation * 4 + 0];
+  ref_K[1] = ref_K_all[rotation * 4 + 1];
+  ref_K[2] = ref_K_all[rotation * 4 + 2];
+  ref_K[3] = ref_K_all[rotation * 4 + 3];
 
   float forward_message[MAX_SRC];
   float sampling_probs[MAX_SRC];
@@ -752,6 +833,26 @@ __kernel void sweep(__global float* depth_map,
           bilateral_color, width, height, src_max_w, src_max_h, window_radius,
           window_step, row, col, rand_depth, curr_normal, sampled_image_idx,
           ref_sum, ref_squared_sum);
+      // Geometric-consistency term (Phase 2c): one geom cost per hypothesis,
+      // accumulated per sample like the photometric cost. The geom cost depends
+      // on depth only; depths = {curr, prev, rand, curr, rand}.
+      if (geom_consistency_term) {
+        costs[0] += geom_regularizer * compute_geom_consistency_cost(
+            pose, ref_K, ref_inv_K, src_depths, src_max_w, src_max_h, row, col,
+            curr_depth, sampled_image_idx, geom_max_cost);
+        costs[1] += geom_regularizer * compute_geom_consistency_cost(
+            pose, ref_K, ref_inv_K, src_depths, src_max_w, src_max_h, row, col,
+            prev_depth, sampled_image_idx, geom_max_cost);
+        costs[2] += geom_regularizer * compute_geom_consistency_cost(
+            pose, ref_K, ref_inv_K, src_depths, src_max_w, src_max_h, row, col,
+            rand_depth, sampled_image_idx, geom_max_cost);
+        costs[3] += geom_regularizer * compute_geom_consistency_cost(
+            pose, ref_K, ref_inv_K, src_depths, src_max_w, src_max_h, row, col,
+            curr_depth, sampled_image_idx, geom_max_cost);
+        costs[4] += geom_regularizer * compute_geom_consistency_cost(
+            pose, ref_K, ref_inv_K, src_depths, src_max_w, src_max_h, row, col,
+            rand_depth, sampled_image_idx, geom_max_cost);
+      }
     }
 
     const int min_cost_idx = find_min_cost(costs);
@@ -796,7 +897,7 @@ __kernel void sweep(__global float* depth_map,
       sel_prob_map[(size_t)image_idx * plane + pix] = prob;
     }
 
-    if (filter_photo) {
+    if (filter_photo || filter_geom) {
       int num_consistent = 0;
       float best_point[3];
       compute_point_at_depth((float)row, (float)col, ref_inv_K, best_depth, best_point);
@@ -808,7 +909,24 @@ __kernel void sweep(__global float* depth_map,
         if (cos_tri > filter_cos_min_triangulation_angle || cos_inc <= 0.0f) {
           continue;
         }
-        if (sel_prob_map[(size_t)image_idx * plane + pix] >= filter_min_ncc_prob) {
+        const float sp = sel_prob_map[(size_t)image_idx * plane + pix];
+        int consistent;
+        if (!filter_geom) {  // photometric only
+          consistent = (sp >= filter_min_ncc_prob);
+        } else if (!filter_photo) {  // geometric only
+          consistent = (compute_geom_consistency_cost(
+                            pose, ref_K, ref_inv_K, src_depths, src_max_w,
+                            src_max_h, row, col, best_depth, image_idx,
+                            geom_max_cost) <= filter_geom_max_cost);
+        } else {  // both
+          consistent =
+              (sp >= filter_min_ncc_prob) &&
+              (compute_geom_consistency_cost(
+                   pose, ref_K, ref_inv_K, src_depths, src_max_w, src_max_h,
+                   row, col, best_depth, image_idx, geom_max_cost) <=
+               filter_geom_max_cost);
+        }
+        if (consistent) {
           consistency_mask[(size_t)image_idx * plane + pix] = 1;
           num_consistent += 1;
         }
