@@ -37,10 +37,29 @@
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+// cl_khr_priority_hints / cl_khr_throttle_hints queue-property values. Defined
+// here (with guards) so we don't depend on a particular cl_ext.h variant; they
+// are only passed when the device advertises the corresponding extension.
+#ifndef CL_QUEUE_PRIORITY_KHR
+#define CL_QUEUE_PRIORITY_KHR 0x1096
+#endif
+#ifndef CL_QUEUE_PRIORITY_LOW_KHR
+#define CL_QUEUE_PRIORITY_LOW_KHR (1 << 2)
+#endif
+#ifndef CL_QUEUE_THROTTLE_KHR
+#define CL_QUEUE_THROTTLE_KHR 0x1097
+#endif
+#ifndef CL_QUEUE_THROTTLE_LOW_KHR
+#define CL_QUEUE_THROTTLE_LOW_KHR (1 << 2)
+#endif
 
 namespace colmap {
 namespace mvs {
@@ -51,9 +70,34 @@ constexpr float kDegToRad = 0.0174532925199432f;
 constexpr int kNumTformParams = 4 + 9 + 3 + 3 + 12 + 12;  // 43
 constexpr int kNumIntensityBins = 256;
 constexpr float kInvMaxIntensity = 1.0f / 255.0f;
-// Number of columns processed per sweep kernel launch, to keep each dispatch
-// below the Windows TDR watchdog (~2 s). Refined for performance in Phase 2d.
-constexpr int kSweepColumnBand = 48;
+// Default number of columns processed per sweep kernel launch. This is the
+// main throughput knob: too small starves the GPU of parallel work-items (each
+// column is one work-item) and tanks throughput; large keeps occupancy up but
+// lengthens each dispatch (and the desktop stalls for the dispatch duration,
+// since the Adreno is the display GPU and the driver exposes no preemption
+// hint). 48 is a throughput/latency balance; lower it if dispatch stalls are
+// annoying (costs speed). Override with COLMAP_OPENCL_SWEEP_BAND. Also keeps
+// each dispatch below the Windows TDR watchdog.
+constexpr int kDefaultSweepColumnBand = 48;
+// Default GPU duty-cycle: after each sweep band the host sleeps for a fraction
+// of the band's wall time so the GPU is idle ~(1-duty) of the time and the
+// desktop gets it back. This is the "cap GPU usage" knob. 1.0 = no throttle
+// (full speed, GPU ~100%). Override with COLMAP_OPENCL_DUTY.
+constexpr float kDefaultGpuDuty = 0.5f;
+
+int EnvInt(const char* name, int fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr) return fallback;
+  const int parsed = std::atoi(v);
+  return parsed > 0 ? parsed : fallback;
+}
+
+float EnvFloat(const char* name, float fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr) return fallback;
+  const float parsed = static_cast<float>(std::atof(v));
+  return (parsed > 0.0f && parsed <= 1.0f) ? parsed : fallback;
+}
 
 std::string CLErrorString(cl_int err) {
   switch (err) {
@@ -361,8 +405,46 @@ void PatchMatchOpenCL::InitDevice() {
       reinterpret_cast<cl_context_properties>(platform_), 0};
   context_ = clCreateContext(context_props, 1, &device_, nullptr, nullptr, &err);
   CheckCL(err, "clCreateContext");
-  queue_ = clCreateCommandQueueWithProperties(context_, device_, nullptr, &err);
+
+  // Request a low-priority / low-throttle command queue when the device
+  // advertises the hints, so the GPU scheduler favors the desktop compositor
+  // (the Adreno is the display GPU). Only passed when supported, otherwise
+  // clCreateCommandQueueWithProperties would return CL_INVALID_QUEUE_PROPERTIES.
+  const std::string extensions =
+      GetDeviceInfoString(device_, CL_DEVICE_EXTENSIONS);
+  const bool no_hints = std::getenv("COLMAP_OPENCL_NO_QUEUE_HINTS") != nullptr;
+  std::vector<cl_queue_properties> queue_props;
+  bool priority_low = false;
+  bool throttle_low = false;
+  if (!no_hints) {
+    if (extensions.find("cl_khr_priority_hints") != std::string::npos) {
+      queue_props.push_back(CL_QUEUE_PRIORITY_KHR);
+      queue_props.push_back(CL_QUEUE_PRIORITY_LOW_KHR);
+      priority_low = true;
+    }
+    if (extensions.find("cl_khr_throttle_hints") != std::string::npos) {
+      queue_props.push_back(CL_QUEUE_THROTTLE_KHR);
+      queue_props.push_back(CL_QUEUE_THROTTLE_LOW_KHR);
+      throttle_low = true;
+    }
+  }
+  queue_props.push_back(0);
+  queue_ = clCreateCommandQueueWithProperties(context_, device_,
+                                              queue_props.data(), &err);
+  if (err != CL_SUCCESS && (priority_low || throttle_low)) {
+    // Fall back to a default queue if the hints are rejected.
+    LOG(WARNING) << "OpenCL low-priority queue rejected (" << CLErrorString(err)
+                 << "); using a default-priority queue.";
+    queue_ = clCreateCommandQueueWithProperties(context_, device_, nullptr,
+                                                &err);
+    priority_low = throttle_low = false;
+  }
   CheckCL(err, "clCreateCommandQueueWithProperties");
+  LOG(INFO) << "OpenCL queue scheduling hints: priority_low=" << priority_low
+            << " throttle_low=" << throttle_low
+            << (priority_low || throttle_low
+                    ? ""
+                    : " (not advertised by the device)");
 }
 
 void PatchMatchOpenCL::BuildProgram() {
@@ -811,6 +893,14 @@ void PatchMatchOpenCL::RunSweeps() {
 
   const float total_num_steps = options_.num_iterations * 4.0f;
 
+  // GPU throttling so the shared Adreno does not starve the desktop.
+  const int sweep_band =
+      EnvInt("COLMAP_OPENCL_SWEEP_BAND", kDefaultSweepColumnBand);
+  const float gpu_duty = EnvFloat("COLMAP_OPENCL_DUTY", kDefaultGpuDuty);
+  LOG(INFO) << "OpenCL GPU throttle: duty=" << gpu_duty << ", band="
+            << sweep_band << " cols (set COLMAP_OPENCL_DUTY=1 + a larger "
+               "COLMAP_OPENCL_SWEEP_BAND for full-speed unattended runs).";
+
   for (int iter = 0; iter < options_.num_iterations; ++iter) {
     Timer iter_timer;
     iter_timer.Start();
@@ -879,15 +969,28 @@ void PatchMatchOpenCL::RunSweeps() {
       SetArg(k_sweep_, a++, sizeof(int), &filter_geom);
       SetArg(k_sweep_, a++, sizeof(float), &filter_geom_max_cost);
 
-      // Column-banded launches (Windows TDR watchdog).
-      for (int c0 = 0; c0 < cur_width_; c0 += kSweepColumnBand) {
+      // Column-banded launches: short dispatches plus a duty-cycle sleep keep
+      // the desktop responsive and stay under the Windows TDR watchdog.
+      for (int c0 = 0; c0 < cur_width_; c0 += sweep_band) {
+        const auto band_start = std::chrono::steady_clock::now();
         const size_t offset = static_cast<size_t>(c0);
         const size_t gsize =
-            std::min(kSweepColumnBand, cur_width_ - c0);
+            static_cast<size_t>(std::min(sweep_band, cur_width_ - c0));
         CheckCL(clEnqueueNDRangeKernel(queue_, k_sweep_, 1, &offset, &gsize,
                                        nullptr, 0, nullptr, nullptr),
                 "clEnqueueNDRangeKernel(sweep)");
         CheckCL(clFinish(queue_), "clFinish(sweep band)");
+        if (gpu_duty < 1.0f) {
+          const double band_ms =
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - band_start)
+                  .count();
+          const long sleep_ms =
+              static_cast<long>(band_ms * (1.0 - gpu_duty) / gpu_duty);
+          if (sleep_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+          }
+        }
       }
 
       RotateMaps(/*rotate_cmask=*/last_sweep && options_.filter);
