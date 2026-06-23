@@ -79,11 +79,12 @@ constexpr float kInvMaxIntensity = 1.0f / 255.0f;
 // annoying (costs speed). Override with COLMAP_OPENCL_SWEEP_BAND. Also keeps
 // each dispatch below the Windows TDR watchdog.
 constexpr int kDefaultSweepColumnBand = 48;
-// Default GPU duty-cycle: after each sweep band the host sleeps for a fraction
-// of the band's wall time so the GPU is idle ~(1-duty) of the time and the
-// desktop gets it back. This is the "cap GPU usage" knob. 1.0 = no throttle
-// (full speed, GPU ~100%). Override with COLMAP_OPENCL_DUTY.
-constexpr float kDefaultGpuDuty = 0.5f;
+// Default GPU duty-cycle. Vanilla behavior is full speed (1.0 = GPU ~100%, like
+// the CUDA backend); throttling is opt-in. Set COLMAP_OPENCL_DUTY < 1 (e.g. 0.5
+// from a launch script) to make the host sleep band_ms*(1-duty)/duty after each
+// sweep band, leaving the shared Adreno idle ~(1-duty) of the time so the
+// desktop stays responsive.
+constexpr float kDefaultGpuDuty = 1.0f;
 
 int EnvInt(const char* name, int fallback) {
   const char* v = std::getenv(name);
@@ -897,9 +898,15 @@ void PatchMatchOpenCL::RunSweeps() {
   const int sweep_band =
       EnvInt("COLMAP_OPENCL_SWEEP_BAND", kDefaultSweepColumnBand);
   const float gpu_duty = EnvFloat("COLMAP_OPENCL_DUTY", kDefaultGpuDuty);
-  LOG(INFO) << "OpenCL GPU throttle: duty=" << gpu_duty << ", band="
-            << sweep_band << " cols (set COLMAP_OPENCL_DUTY=1 + a larger "
-               "COLMAP_OPENCL_SWEEP_BAND for full-speed unattended runs).";
+  if (gpu_duty < 1.0f) {
+    LOG(INFO) << "OpenCL GPU throttle ON: duty=" << gpu_duty << ", band="
+              << sweep_band << " cols (GPU idle ~" << (1.0f - gpu_duty) * 100.0f
+              << "% of the time for desktop responsiveness).";
+  } else {
+    LOG(INFO) << "OpenCL GPU: full speed (band=" << sweep_band
+              << "). Set COLMAP_OPENCL_DUTY=0.5 (or lower) to throttle and keep "
+                 "the desktop responsive.";
+  }
 
   for (int iter = 0; iter < options_.num_iterations; ++iter) {
     Timer iter_timer;
