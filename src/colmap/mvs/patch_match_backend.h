@@ -61,11 +61,13 @@ class PatchMatchBackend {
 enum class PatchMatchBackendType {
   kCuda,
   kCpu,
+  kOpenCL,
 };
 
-// Resolve the backend type from the option string {auto, cuda, cpu}.
+// Resolve the backend type from the option string {auto, cuda, cpu, opencl}.
 // For "auto", CUDA is selected if compiled in and at least one device is
-// available, otherwise the CPU backend is selected. Throws for invalid
+// available, otherwise the CPU backend is selected (the OpenCL backend is not
+// auto-selected yet, since it is still being brought up). Throws for invalid
 // values or if an explicitly requested backend is unavailable.
 PatchMatchBackendType ResolvePatchMatchBackend(const std::string& backend);
 

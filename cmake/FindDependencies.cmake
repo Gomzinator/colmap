@@ -245,6 +245,23 @@ else()
     set(CUDA_ENABLED OFF)
 endif()
 
+# OpenCL dense-stereo backend (orthogonal to CUDA). The vcpkg `opencl` feature
+# provides the Khronos headers + ICD loader; the actual GPU implementation is
+# the system ICD discovered at runtime (e.g. the Adreno driver on Snapdragon).
+if(OPENCL_ENABLED)
+    find_package(OpenCL QUIET)
+    if(OpenCL_FOUND)
+        list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_OPENCL_ENABLED)
+        message(STATUS "Enabling OpenCL support "
+                       "(version: ${OpenCL_VERSION_STRING})")
+    else()
+        message(STATUS "Disabling OpenCL support (not found)")
+        set(OPENCL_ENABLED OFF)
+    endif()
+else()
+    message(STATUS "Disabling OpenCL support")
+endif()
+
 if(ONNX_ENABLED)
     if(FETCH_ONNX)
         include(FetchContent)

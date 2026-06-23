@@ -44,6 +44,10 @@
 #include "colmap/util/cuda.h"
 #endif
 
+#if defined(COLMAP_OPENCL_ENABLED)
+#include "colmap/mvs/patch_match_opencl.h"
+#endif
+
 #include <numeric>
 #include <set>
 #include <unordered_set>
@@ -70,16 +74,26 @@ PatchMatchBackendType ResolvePatchMatchBackend(const std::string& backend) {
 #endif
   } else if (backend_lower_case == "cpu") {
     return PatchMatchBackendType::kCpu;
+  } else if (backend_lower_case == "opencl") {
+#if defined(COLMAP_OPENCL_ENABLED)
+    return PatchMatchBackendType::kOpenCL;
+#else
+    LOG(FATAL_THROW) << "PatchMatchStereo.backend is set to 'opencl', but "
+                        "COLMAP was compiled without OpenCL support.";
+#endif
   } else if (backend_lower_case == "auto") {
 #if defined(COLMAP_CUDA_ENABLED)
     if (GetNumCudaDevices() > 0) {
       return PatchMatchBackendType::kCuda;
     }
 #endif
+    // Note: the OpenCL backend is not auto-selected yet (kernels are still
+    // being brought up); request it explicitly with --PatchMatchStereo.backend
+    // opencl.
     return PatchMatchBackendType::kCpu;
   }
   LOG(FATAL_THROW) << "Invalid PatchMatchStereo.backend: '" << backend
-                   << "'. Valid values are {auto, cuda, cpu}.";
+                   << "'. Valid values are {auto, cuda, cpu, opencl}.";
   return PatchMatchBackendType::kCpu;
 }
 
@@ -173,6 +187,14 @@ void PatchMatch::Run() {
     case PatchMatchBackendType::kCpu:
       backend_ = std::make_unique<PatchMatchCpu>(options_, problem_);
       break;
+    case PatchMatchBackendType::kOpenCL:
+#if defined(COLMAP_OPENCL_ENABLED)
+      backend_ = std::make_unique<PatchMatchOpenCL>(options_, problem_);
+      break;
+#else
+      LOG(FATAL_THROW) << "OpenCL backend requested, but COLMAP was compiled "
+                          "without OpenCL.";
+#endif
   }
   backend_->Run();
 }
@@ -412,8 +434,9 @@ void PatchMatchController::ReadProblems() {
 }
 
 void PatchMatchController::ReadGpuIndices() {
-  if (ResolvePatchMatchBackend(options_.backend) ==
-      PatchMatchBackendType::kCpu) {
+  const PatchMatchBackendType backend =
+      ResolvePatchMatchBackend(options_.backend);
+  if (backend == PatchMatchBackendType::kCpu) {
     resolved_backend_ = "cpu";
     // The CPU backend parallelizes internally over image columns, so a
     // single worker processes one problem at a time.
@@ -423,6 +446,14 @@ void PatchMatchController::ReadGpuIndices() {
            "orders of magnitude slower than the CUDA backend. Consider "
            "reducing --PatchMatchStereo.max_image_size and/or setting "
            "--PatchMatchStereo.window_step 2 to speed up the computation.";
+    return;
+  }
+  if (backend == PatchMatchBackendType::kOpenCL) {
+    resolved_backend_ = "opencl";
+    // The OpenCL backend drives a single GPU device and manages its own
+    // intra-image parallelism, so a single worker processes one problem at a
+    // time (the device is selected internally by PatchMatchOpenCL).
+    gpu_indices_ = {-1};
     return;
   }
   resolved_backend_ = "cuda";

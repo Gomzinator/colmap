@@ -50,8 +50,8 @@ class PatchMatchBackend;
 class Workspace;
 
 // This is a wrapper class around the actual PatchMatch backend
-// implementations (CUDA or CPU). The backend is selected at runtime via
-// PatchMatchOptions::backend. This class is also necessary to hide Cuda code
+// implementations (CUDA, CPU, or OpenCL). The backend is selected at runtime
+// via PatchMatchOptions::backend. This class is also necessary to hide Cuda code
 // from any boost or Eigen code, since NVCC/MSVC cannot compile complex C++
 // code.
 class PatchMatch {

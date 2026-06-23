@@ -72,7 +72,8 @@ void PatchMatchOptions::Print() const {
 }
 
 bool PatchMatchOptions::Check() const {
-  CHECK_OPTION(backend == "auto" || backend == "cuda" || backend == "cpu");
+  CHECK_OPTION(backend == "auto" || backend == "cuda" || backend == "cpu" ||
+               backend == "opencl");
   if (depth_min != -1.0f || depth_max != -1.0f) {
     CHECK_OPTION_LE(depth_min, depth_max);
     CHECK_OPTION_GE(depth_min, 0.0f);

@@ -283,6 +283,21 @@ if(CUDA_ENABLED)
     )
 endif()
 
+# OpenCL dense-stereo backend (Adreno/Qualcomm and other GPUs via the system
+# ICD). Orthogonal to the CUDA backend; both can be compiled in independently.
+if(OPENCL_ENABLED)
+    COLMAP_ADD_LIBRARY(
+        NAME colmap_mvs_opencl
+        SRCS
+            patch_match_opencl.h patch_match_opencl.cc
+        PUBLIC_LINK_LIBS
+            colmap_mvs
+            OpenCL::OpenCL
+        PRIVATE_LINK_LIBS
+            colmap_math
+    )
+endif()
+
 # PatchMatch wrapper, controller, and backend factory. Built unconditionally;
 # links the CUDA backend only when available. This breaks the previous
 # situation where the (CUDA-independent) controller was only compiled with
@@ -300,5 +315,10 @@ if(CUDA_ENABLED)
     target_link_libraries(colmap_mvs_patch_match PRIVATE
         colmap_mvs_cuda
         colmap_util_cuda
+    )
+endif()
+if(OPENCL_ENABLED)
+    target_link_libraries(colmap_mvs_patch_match PRIVATE
+        colmap_mvs_opencl
     )
 endif()

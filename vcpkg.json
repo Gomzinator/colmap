@@ -66,6 +66,12 @@
                 "cuda"
             ]
         },
+        "opencl": {
+            "description": "Build with OpenCL support (Adreno/Qualcomm and other GPUs via the system ICD). Orthogonal to cuda.",
+            "dependencies": [
+                "opencl"
+            ]
+        },
         "onnx": {
             "description": "Build with ONNX support.",
             "dependencies": [
