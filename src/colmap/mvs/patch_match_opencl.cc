@@ -334,8 +334,9 @@ PatchMatchOpenCL::PatchMatchOpenCL(const PatchMatchOptions& options,
   // (S6's premise). S7 ctypes tests proved no buffer/malloc ceiling (single
   // 512 MB and 8x64 MB concurrent buffers verified clean). The real large-image
   // failure was per-WORK-ITEM (per-column) WORK in the sweep, now bounded by
-  // row-chunking in RunSweeps. The only remaining hard buffer limit is the
-  // device's max single allocation, checked in InitHostDataAndUpload.
+  // row-chunking in RunSweeps. No buffer-size guard is needed: an allocation
+  // beyond the device's max single allocation is simply rejected by
+  // clCreateBuffer (CheckCL throws).
 
   InitDevice();
   BuildProgram();
@@ -764,27 +765,6 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
   const cl_mem_flags rw = CL_MEM_READ_WRITE;
   const cl_mem_flags ro_copy = CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR;
   const cl_mem_flags rw_copy = CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR;
-
-  // The largest single allocations are the per-source maps (cost / sel_prob /
-  // prev_sel_prob / scratch), num_src * W * H * 4 bytes. There is no Adreno
-  // "small buffer" ceiling (that S6 premise was disproven), but a buffer still
-  // cannot exceed the device's max single allocation. Refuse with a clear,
-  // actionable error rather than letting clCreateBuffer fail cryptically.
-  const cl_ulong max_alloc =
-      GetDeviceInfo<cl_ulong>(device_, CL_DEVICE_MAX_MEM_ALLOC_SIZE);
-  const size_t per_src_buf_bytes =
-      static_cast<size_t>(num_src_) * plane * sizeof(float);
-  if (max_alloc > 0 &&
-      per_src_buf_bytes > static_cast<size_t>(max_alloc)) {
-    LOG(FATAL_THROW)
-        << "OpenCL backend: a per-source map needs "
-        << (per_src_buf_bytes >> 20) << " MB (num_src=" << num_src_ << " x "
-        << ref_width_ << "x" << ref_height_
-        << "), exceeding the device max single allocation of "
-        << (max_alloc >> 20)
-        << " MB. Reduce --PatchMatchStereo.max_image_size or the number of "
-           "source images (__auto__,N), or use --PatchMatchStereo.backend cpu.";
-  }
 
   depth_buf_ = CreateBuffer(context_, rw_copy, plane * sizeof(float),
                             depth_host.data());
