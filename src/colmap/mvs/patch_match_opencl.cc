@@ -1129,9 +1129,35 @@ void PatchMatchOpenCL::Run() {
     SetArg(k_initial_cost_, a++, sizeof(int), &window_radius_);
     SetArg(k_initial_cost_, a++, sizeof(int), &window_step_);
     SetArg(k_initial_cost_, a++, sizeof(int), &rotation_);
-    Enqueue2D(queue_, device_, k_initial_cost_, cur_width_, cur_height_,
-              "clEnqueueNDRangeKernel(compute_initial_cost)");
-    CheckCL(clFinish(queue_), "clFinish(initial_cost)");
+    // The initial-cost kernel is compute-heavy (num_src bilaterally-weighted NCC
+    // costs per pixel) and was launched as ONE 2D dispatch over the whole image.
+    // The Adreno silently truncates any single dispatch running longer than the
+    // ~2.4 s GPU watchdog (TDR) and returns garbage with no error, so band it by
+    // rows; per-dispatch work ~ width*rows*num_src is kept well under the limit.
+    {
+      size_t kwg = 0;
+      clGetKernelWorkGroupInfo(k_initial_cost_, device_,
+                               CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &kwg,
+                               nullptr);
+      size_t L = 16;
+      while (L > 1 && L * L > kwg) L /= 2;
+      const long init_budget = 1500000;  // width*rows*num_src per dispatch
+      const int init_rows = static_cast<int>(std::max<long>(
+          static_cast<long>(L),
+          init_budget / (static_cast<long>(cur_width_) * num_src_)));
+      for (int r0 = 0; r0 < cur_height_; r0 += init_rows) {
+        const int rows = std::min(init_rows, cur_height_ - r0);
+        const size_t off[2] = {0, static_cast<size_t>(r0)};
+        const size_t gws[2] = {
+            ((static_cast<size_t>(cur_width_) + L - 1) / L) * L,
+            ((static_cast<size_t>(rows) + L - 1) / L) * L};
+        const size_t lws[2] = {L, L};
+        CheckCL(clEnqueueNDRangeKernel(queue_, k_initial_cost_, 2, off, gws, lws,
+                                       0, nullptr, nullptr),
+                "clEnqueueNDRangeKernel(compute_initial_cost)");
+        CheckCL(clFinish(queue_), "clFinish(initial_cost band)");
+      }
+    }
   }
 
   RunSweeps();
