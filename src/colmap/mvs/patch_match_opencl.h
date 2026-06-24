@@ -111,7 +111,8 @@ class PatchMatchOpenCL : public PatchMatchBackend {
 
   cl_program program_ = nullptr;
   cl_kernel k_initial_cost_ = nullptr;
-  cl_kernel k_sweep_ = nullptr;
+  cl_kernel k_sweep_bwd_ = nullptr;
+  cl_kernel k_sweep_fwd_ = nullptr;
   cl_kernel k_rot_f_ = nullptr;
   cl_kernel k_rot_u8_ = nullptr;
   cl_kernel k_rot_rand_ = nullptr;
@@ -156,6 +157,14 @@ class PatchMatchOpenCL : public PatchMatchBackend {
   cl_mem ref_K_buf_ = nullptr;          // float 16 (geom)
   cl_mem bilateral_spatial_buf_ = nullptr;
   cl_mem bilateral_color_buf_ = nullptr;
+  // Per-column forward-pass carry buffers: persist prev depth/normal and the
+  // forward messages between row-chunk launches of the forward sweep. Sized for
+  // the larger image dimension (fits both rotation orientations); fully consumed
+  // within one forward pass, so they are neither rotated nor persisted across
+  // sweeps. Small (num_src * max(W,H) floats), unaffected by the buffer story.
+  cl_mem fwd_prev_depth_buf_ = nullptr;   // float max(W,H)
+  cl_mem fwd_prev_normal_buf_ = nullptr;  // float 3*max(W,H)
+  cl_mem fwd_message_buf_ = nullptr;      // float num_src*max(W,H)
 
   // Results (filled by Run()).
   DepthMap result_depth_;

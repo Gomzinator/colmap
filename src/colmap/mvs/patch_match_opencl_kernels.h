@@ -655,52 +655,109 @@ __kernel void compute_initial_cost(__global const float* depth_map,
 }
 
 // ===========================================================================
-// Kernel: sweep from top to bottom (one work-item per column).
-// Photometric cost, plus an optional geometric-consistency term when
-// geom_consistency_term != 0 (Phase 2c). The photometric and/or geometric
-// filter runs on the last sweep (filter_photo / filter_geom).
+// Kernel: backward message pass (one work-item per column), chunked over rows.
+// Walks rows [row_begin, row_end) from high to low and writes the backward
+// messages (betas) into sel_prob_map. The WHOLE column must be covered (all
+// chunks) before the forward sweep reads the betas. The running beta is carried
+// between chunks via sel_prob_map[row_end] (written by the previous, higher
+// chunk); the top chunk (row_end == height) seeds it with KUNIFORM_PROB. Uses
+// the photometric NCC cost only (cost_map), identical in the photometric and
+// geometric passes (the geom term never enters the message passing).
 // ===========================================================================
-__kernel void sweep(__global float* depth_map,
-                    __global float* normal_map,
-                    __global const uchar* ref_image,
-                    __global const float* ref_sum_image,
-                    __global const float* ref_squared_sum_image,
-                    __global const uchar* src_images,
-                    __global const float* poses,
-                    __global const float* ref_inv_K_all,
-                    __global const float* bilateral_spatial,
-                    __global const float* bilateral_color,
-                    __global ulong2* rand_state,
-                    __global float* sel_prob_map,
-                    __global const float* prev_sel_prob_map,
-                    __global float* cost_map,
-                    __global uchar* consistency_mask,
-                    int width,
-                    int height,
-                    int num_src,
-                    int src_max_w,
-                    int src_max_h,
-                    int window_radius,
-                    int window_step,
-                    int rotation,
-                    int num_samples,
-                    float perturbation,
-                    float prev_sel_prob_weight,
-                    float inv_ncc_sigma_sq,
-                    float ncc_norm_factor,
-                    float cos_min_triangulation_angle,
-                    float inv_incident_angle_sigma_sq,
-                    int filter_photo,
-                    float filter_min_ncc_prob,
-                    float filter_cos_min_triangulation_angle,
-                    int filter_min_num_consistent,
-                    __global const float* src_depths,
-                    __global const float* ref_K_all,
-                    int geom_consistency_term,
-                    float geom_regularizer,
-                    float geom_max_cost,
-                    int filter_geom,
-                    float filter_geom_max_cost) {
+__kernel void sweep_backward(__global const float* cost_map,
+                             __global float* sel_prob_map,
+                             int width,
+                             int height,
+                             int num_src,
+                             float inv_ncc_sigma_sq,
+                             float ncc_norm_factor,
+                             int row_begin,
+                             int row_end) {
+  const int col = get_global_id(0);
+  if (col >= width) {
+    return;
+  }
+  const size_t plane = (size_t)width * height;
+  const int row_hi = row_end - 1;
+  for (int image_idx = 0; image_idx < num_src; ++image_idx) {
+    float beta;
+    if (row_end >= height) {
+      beta = KUNIFORM_PROB;
+    } else {
+      // Resume from the beta the previous (higher) chunk left at row_end.
+      beta = sel_prob_map[(size_t)image_idx * plane +
+                          (size_t)row_end * width + col];
+    }
+    for (int row = row_hi; row >= row_begin; --row) {
+      const float cost =
+          cost_map[(size_t)image_idx * plane + (size_t)row * width + col];
+      beta = compute_message(cost, beta, 0, inv_ncc_sigma_sq, ncc_norm_factor);
+      sel_prob_map[(size_t)image_idx * plane + (size_t)row * width + col] = beta;
+    }
+  }
+}
+
+// ===========================================================================
+// Kernel: forward sweep top->bottom (one work-item per column), chunked over
+// rows [row_begin, row_end). Photometric cost, plus an optional geometric-
+// consistency term when geom_consistency_term != 0 (Phase 2c). The photometric
+// and/or geometric filter runs on the last sweep (filter_photo / filter_geom).
+//
+// Per-column state (prev depth/normal, forward messages, PRNG) is carried
+// between row-chunks via fwd_prev_depth / fwd_prev_normal / fwd_message and the
+// rand_state buffer, so each launch does bounded per-work-item work (the
+// large-image garbage was a per-column-work threshold; see
+// OPENCL_LARGE_IMAGE_BUG.md). On the first chunk (row_begin == 0) the state is
+// seeded exactly as the original single-dispatch kernel, so the chunked result
+// is bit-identical to it. The whole column's betas must already be in
+// sel_prob_map (written by sweep_backward) before this runs.
+// ===========================================================================
+__kernel void sweep_forward(__global float* depth_map,
+                            __global float* normal_map,
+                            __global const uchar* ref_image,
+                            __global const float* ref_sum_image,
+                            __global const float* ref_squared_sum_image,
+                            __global const uchar* src_images,
+                            __global const float* poses,
+                            __global const float* ref_inv_K_all,
+                            __global const float* bilateral_spatial,
+                            __global const float* bilateral_color,
+                            __global ulong2* rand_state,
+                            __global float* sel_prob_map,
+                            __global const float* prev_sel_prob_map,
+                            __global float* cost_map,
+                            __global uchar* consistency_mask,
+                            int width,
+                            int height,
+                            int num_src,
+                            int src_max_w,
+                            int src_max_h,
+                            int window_radius,
+                            int window_step,
+                            int rotation,
+                            int num_samples,
+                            float perturbation,
+                            float prev_sel_prob_weight,
+                            float inv_ncc_sigma_sq,
+                            float ncc_norm_factor,
+                            float cos_min_triangulation_angle,
+                            float inv_incident_angle_sigma_sq,
+                            int filter_photo,
+                            float filter_min_ncc_prob,
+                            float filter_cos_min_triangulation_angle,
+                            int filter_min_num_consistent,
+                            __global const float* src_depths,
+                            __global const float* ref_K_all,
+                            int geom_consistency_term,
+                            float geom_regularizer,
+                            float geom_max_cost,
+                            int filter_geom,
+                            float filter_geom_max_cost,
+                            __global float* fwd_prev_depth,
+                            __global float* fwd_prev_normal,
+                            __global float* fwd_message,
+                            int row_begin,
+                            int row_end) {
   const int col = get_global_id(0);
   if (col >= width) {
     return;
@@ -723,28 +780,37 @@ __kernel void sweep(__global float* depth_map,
   float forward_message[MAX_SRC];
   float sampling_probs[MAX_SRC];
 
-  // Backward pass: store backward messages temporarily in sel_prob_map.
-  for (int image_idx = 0; image_idx < num_src; ++image_idx) {
-    float beta = KUNIFORM_PROB;
-    for (int row = height - 1; row >= 0; --row) {
-      const float cost = cost_map[(size_t)image_idx * plane + (size_t)row * width + col];
-      beta = compute_message(cost, beta, 0, inv_ncc_sigma_sq, ncc_norm_factor);
-      sel_prob_map[(size_t)image_idx * plane + (size_t)row * width + col] = beta;
-    }
-    forward_message[image_idx] = KUNIFORM_PROB;
-  }
-
-  // PRNG state for this column (row 0, like the CUDA/CPU kernels).
+  // PRNG state for this column (row 0, like the CUDA/CPU kernels). Carried
+  // across row-chunks via rand_state[col] (written back at the end of each
+  // chunk); rs_inc is invariant so re-reading .y resumes the same stream.
   ulong rs_state = rand_state[col].x;
   const ulong rs_inc = rand_state[col].y;
 
-  float prev_depth = depth_map[(size_t)0 * width + col];
+  // Per-column forward state. First chunk (row_begin == 0): seed exactly like
+  // the original single-dispatch kernel. Later chunks: resume from the state the
+  // previous chunk persisted. The whole column's betas are already in
+  // sel_prob_map (written by sweep_backward).
+  float prev_depth;
   float prev_normal[3];
-  prev_normal[0] = normal_map[0 * plane + (size_t)0 * width + col];
-  prev_normal[1] = normal_map[1 * plane + (size_t)0 * width + col];
-  prev_normal[2] = normal_map[2 * plane + (size_t)0 * width + col];
+  if (row_begin == 0) {
+    prev_depth = depth_map[(size_t)0 * width + col];
+    prev_normal[0] = normal_map[0 * plane + (size_t)0 * width + col];
+    prev_normal[1] = normal_map[1 * plane + (size_t)0 * width + col];
+    prev_normal[2] = normal_map[2 * plane + (size_t)0 * width + col];
+    for (int image_idx = 0; image_idx < num_src; ++image_idx) {
+      forward_message[image_idx] = KUNIFORM_PROB;
+    }
+  } else {
+    prev_depth = fwd_prev_depth[col];
+    prev_normal[0] = fwd_prev_normal[(size_t)0 * width + col];
+    prev_normal[1] = fwd_prev_normal[(size_t)1 * width + col];
+    prev_normal[2] = fwd_prev_normal[(size_t)2 * width + col];
+    for (int image_idx = 0; image_idx < num_src; ++image_idx) {
+      forward_message[image_idx] = fwd_message[(size_t)image_idx * width + col];
+    }
+  }
 
-  for (int row = 0; row < height; ++row) {
+  for (int row = row_begin; row < row_end; ++row) {
     const size_t pix = (size_t)row * width + col;
     const float ref_sum = ref_sum_image[pix];
     const float ref_squared_sum = ref_squared_sum_image[pix];
@@ -948,6 +1014,14 @@ __kernel void sweep(__global float* depth_map,
     prev_normal[2] = best_normal[2];
   }
 
+  // Persist per-column forward state for the next row-chunk.
+  fwd_prev_depth[col] = prev_depth;
+  fwd_prev_normal[(size_t)0 * width + col] = prev_normal[0];
+  fwd_prev_normal[(size_t)1 * width + col] = prev_normal[1];
+  fwd_prev_normal[(size_t)2 * width + col] = prev_normal[2];
+  for (int image_idx = 0; image_idx < num_src; ++image_idx) {
+    fwd_message[(size_t)image_idx * width + col] = forward_message[image_idx];
+  }
   rand_state[col] = (ulong2)(rs_state, rs_inc);
 }
 

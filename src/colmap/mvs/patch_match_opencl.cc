@@ -85,6 +85,14 @@ constexpr int kDefaultSweepColumnBand = 48;
 // sweep band, leaving the shared Adreno idle ~(1-duty) of the time so the
 // desktop stays responsive.
 constexpr float kDefaultGpuDuty = 1.0f;
+// Default per-work-item (per-column) work budget for ONE forward-sweep dispatch,
+// in photo-cost window-samples. The Adreno silently garbages a sweep work-item
+// above ~1.5M such samples per column (see OPENCL_LARGE_IMAGE_BUG.md); we chunk
+// the per-column sweep over the row dimension so each launch stays under this.
+// ~1.0M leaves margin below the empirical threshold (1.40M was still clean).
+// Override with COLMAP_OPENCL_ROW_CHUNK_WORK, or set rows directly with
+// COLMAP_OPENCL_ROW_CHUNK.
+constexpr int kDefaultRowChunkWork = 1000000;
 
 int EnvInt(const char* name, int fallback) {
   const char* v = std::getenv(name);
@@ -322,34 +330,12 @@ PatchMatchOpenCL::PatchMatchOpenCL(const PatchMatchOptions& options,
                         "image count.";
   }
 
-  // The Adreno silently mis-addresses single buffers above ~32 MB (despite
-  // reporting a 1 GB CL_DEVICE_MAX_MEM_ALLOC_SIZE), producing garbage depth maps
-  // with no error. The per-source maps (cost / sel_prob / scratch) are
-  // num_src * width * height * 4 bytes; refuse to run (loud error) rather than
-  // silently produce wrong results when that exceeds a safe limit. The limit is
-  // conservative (600px @ 20 sources = 21.6 MB is validated good; 800px @ 20 =
-  // 38 MB is garbage) and overridable for experimentation.
-  const size_t plane =
-      static_cast<size_t>(ref_width_) * static_cast<size_t>(ref_height_);
-  const size_t per_src_buf_bytes =
-      static_cast<size_t>(num_src_) * plane * sizeof(float);
-  size_t max_buf_mb = 24;
-  if (const char* e = std::getenv("COLMAP_OPENCL_MAX_BUFFER_MB")) {
-    const long v = std::atol(e);
-    if (v > 0) max_buf_mb = static_cast<size_t>(v);
-  }
-  if (per_src_buf_bytes > max_buf_mb * 1024 * 1024) {
-    LOG(FATAL_THROW)
-        << "OpenCL backend: per-source map buffer is "
-        << (per_src_buf_bytes >> 20) << " MB (num_src=" << num_src_ << " x "
-        << ref_width_ << "x" << ref_height_
-        << "), exceeding the safe ~" << max_buf_mb
-        << " MB Adreno single-buffer addressing limit. Above it the GPU "
-           "silently mis-addresses the buffer and produces garbage. Reduce "
-           "--PatchMatchStereo.max_image_size or the number of source images "
-           "(__auto__,N), use --PatchMatchStereo.backend cpu for full "
-           "resolution, or raise COLMAP_OPENCL_MAX_BUFFER_MB to experiment.";
-  }
+  // NOTE: the earlier "~32 MB Adreno single-buffer addressing limit" was WRONG
+  // (S6's premise). S7 ctypes tests proved no buffer/malloc ceiling (single
+  // 512 MB and 8x64 MB concurrent buffers verified clean). The real large-image
+  // failure was per-WORK-ITEM (per-column) WORK in the sweep, now bounded by
+  // row-chunking in RunSweeps. The only remaining hard buffer limit is the
+  // device's max single allocation, checked in InitHostDataAndUpload.
 
   InitDevice();
   BuildProgram();
@@ -362,12 +348,14 @@ PatchMatchOpenCL::~PatchMatchOpenCL() {
       ref_sqsum_buf_,    cost_buf_,      rand_buf_,          sel_prob_buf_,
       prev_sel_prob_buf_, cmask_buf_,    scratch_buf_,       src_images_buf_,
       src_depth_buf_,    poses_buf_,     ref_inv_K_buf_,     ref_K_buf_,
-      bilateral_spatial_buf_, bilateral_color_buf_};
+      bilateral_spatial_buf_, bilateral_color_buf_,
+      fwd_prev_depth_buf_, fwd_prev_normal_buf_, fwd_message_buf_};
   for (cl_mem buf : buffers) {
     if (buf != nullptr) clReleaseMemObject(buf);
   }
-  const cl_kernel kernels[] = {k_initial_cost_, k_sweep_,     k_rot_f_,
-                               k_rot_u8_,       k_rot_rand_,   k_rot_normal_};
+  const cl_kernel kernels[] = {k_initial_cost_, k_sweep_bwd_,  k_sweep_fwd_,
+                               k_rot_f_,        k_rot_u8_,     k_rot_rand_,
+                               k_rot_normal_};
   for (cl_kernel kernel : kernels) {
     if (kernel != nullptr) clReleaseKernel(kernel);
   }
@@ -527,8 +515,10 @@ void PatchMatchOpenCL::BuildProgram() {
 
   k_initial_cost_ = clCreateKernel(program_, "compute_initial_cost", &err);
   CheckCL(err, "clCreateKernel(compute_initial_cost)");
-  k_sweep_ = clCreateKernel(program_, "sweep", &err);
-  CheckCL(err, "clCreateKernel(sweep)");
+  k_sweep_bwd_ = clCreateKernel(program_, "sweep_backward", &err);
+  CheckCL(err, "clCreateKernel(sweep_backward)");
+  k_sweep_fwd_ = clCreateKernel(program_, "sweep_forward", &err);
+  CheckCL(err, "clCreateKernel(sweep_forward)");
   k_rot_f_ = clCreateKernel(program_, "rotate_ccw_f", &err);
   CheckCL(err, "clCreateKernel(rotate_ccw_f)");
   k_rot_u8_ = clCreateKernel(program_, "rotate_ccw_u8", &err);
@@ -775,6 +765,27 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
   const cl_mem_flags ro_copy = CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR;
   const cl_mem_flags rw_copy = CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR;
 
+  // The largest single allocations are the per-source maps (cost / sel_prob /
+  // prev_sel_prob / scratch), num_src * W * H * 4 bytes. There is no Adreno
+  // "small buffer" ceiling (that S6 premise was disproven), but a buffer still
+  // cannot exceed the device's max single allocation. Refuse with a clear,
+  // actionable error rather than letting clCreateBuffer fail cryptically.
+  const cl_ulong max_alloc =
+      GetDeviceInfo<cl_ulong>(device_, CL_DEVICE_MAX_MEM_ALLOC_SIZE);
+  const size_t per_src_buf_bytes =
+      static_cast<size_t>(num_src_) * plane * sizeof(float);
+  if (max_alloc > 0 &&
+      per_src_buf_bytes > static_cast<size_t>(max_alloc)) {
+    LOG(FATAL_THROW)
+        << "OpenCL backend: a per-source map needs "
+        << (per_src_buf_bytes >> 20) << " MB (num_src=" << num_src_ << " x "
+        << ref_width_ << "x" << ref_height_
+        << "), exceeding the device max single allocation of "
+        << (max_alloc >> 20)
+        << " MB. Reduce --PatchMatchStereo.max_image_size or the number of "
+           "source images (__auto__,N), or use --PatchMatchStereo.backend cpu.";
+  }
+
   depth_buf_ = CreateBuffer(context_, rw_copy, plane * sizeof(float),
                             depth_host.data());
   normal_buf_ = CreateBuffer(context_, rw_copy, 3 * plane * sizeof(float),
@@ -830,6 +841,20 @@ void PatchMatchOpenCL::InitHostDataAndUpload() {
   bilateral_color_buf_ = CreateBuffer(
       context_, ro_copy, bilateral_color.size() * sizeof(float),
       bilateral_color.data());
+
+  // Per-column forward-pass carry buffers (tiny). Sized for the larger image
+  // dimension so they fit both rotation orientations; the forward kernel indexes
+  // them with the current width (<= max_dim) and they are fully consumed within
+  // a single forward pass, so no rotation or cross-sweep persistence is needed.
+  const size_t max_dim =
+      static_cast<size_t>(std::max(ref_width_, ref_height_));
+  fwd_prev_depth_buf_ = CreateBuffer(context_, rw, max_dim * sizeof(float),
+                                     nullptr);
+  fwd_prev_normal_buf_ = CreateBuffer(context_, rw, 3 * max_dim * sizeof(float),
+                                      nullptr);
+  fwd_message_buf_ = CreateBuffer(
+      context_, rw, static_cast<size_t>(num_src_) * max_dim * sizeof(float),
+      nullptr);
 
   // Previous selection probabilities start at 0.5 (CPU InitWorkspaceMemory).
   const float half = 0.5f;
@@ -955,15 +980,66 @@ void PatchMatchOpenCL::RunSweeps() {
   const int sweep_band =
       EnvInt("COLMAP_OPENCL_SWEEP_BAND", kDefaultSweepColumnBand);
   const float gpu_duty = EnvFloat("COLMAP_OPENCL_DUTY", kDefaultGpuDuty);
+
+  // Row-chunking: bound per-work-item (per-column) work per dispatch. Each
+  // sweep work-item processes a full image column; above ~1.5M photo-cost
+  // window-samples per column the Adreno silently garbages the result (NOT a
+  // buffer/TDR limit -- see OPENCL_LARGE_IMAGE_BUG.md). Split the column sweep
+  // over the row dimension into multiple launches that persist per-column state
+  // between them (prev depth/normal, forward messages, PRNG via rand_state, and
+  // the backward betas which already live in sel_prob_map). chunk_rows is sized
+  // so each forward dispatch stays under the work budget; the chunked result is
+  // bit-identical to the original single-dispatch sweep.
+  const long window_steps =
+      (2L * window_radius_) / std::max(1, window_step_) + 1;
+  const long window_samples = window_steps * window_steps;
+  const long work_per_row =
+      static_cast<long>(num_samples * 4 + num_src_) * window_samples;
+  const long row_chunk_budget =
+      EnvInt("COLMAP_OPENCL_ROW_CHUNK_WORK", kDefaultRowChunkWork);
+  int chunk_rows = static_cast<int>(
+      std::max<long>(1, row_chunk_budget / std::max<long>(1, work_per_row)));
+  chunk_rows = EnvInt("COLMAP_OPENCL_ROW_CHUNK", chunk_rows);
+  chunk_rows = std::max(1, chunk_rows);
+
   if (gpu_duty < 1.0f) {
     LOG(INFO) << "OpenCL GPU throttle ON: duty=" << gpu_duty << ", band="
               << sweep_band << " cols (GPU idle ~" << (1.0f - gpu_duty) * 100.0f
-              << "% of the time for desktop responsiveness).";
+              << "% of the time for desktop responsiveness). Row chunk="
+              << chunk_rows << " rows (~" << (chunk_rows * work_per_row)
+              << " work/col/dispatch).";
   } else {
     LOG(INFO) << "OpenCL GPU: full speed (band=" << sweep_band
-              << "). Set COLMAP_OPENCL_DUTY=0.5 (or lower) to throttle and keep "
-                 "the desktop responsive.";
+              << ", row chunk=" << chunk_rows << " rows). Set "
+                 "COLMAP_OPENCL_DUTY=0.5 (or lower) to throttle and keep the "
+                 "desktop responsive.";
   }
+
+  // Enqueue a 1D kernel over the columns [0, W) in bands (one work-item per
+  // column), with a clFinish + optional duty-cycle sleep after each band so the
+  // shared Adreno does not starve the desktop and each dispatch stays under the
+  // Windows TDR watchdog.
+  auto dispatch_banded = [&](cl_kernel kernel, int W, const char* what) {
+    for (int c0 = 0; c0 < W; c0 += sweep_band) {
+      const auto band_start = std::chrono::steady_clock::now();
+      const size_t offset = static_cast<size_t>(c0);
+      const size_t gsize = static_cast<size_t>(std::min(sweep_band, W - c0));
+      CheckCL(clEnqueueNDRangeKernel(queue_, kernel, 1, &offset, &gsize, nullptr,
+                                     0, nullptr, nullptr),
+              what);
+      CheckCL(clFinish(queue_), "clFinish(sweep band)");
+      if (gpu_duty < 1.0f) {
+        const double band_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - band_start)
+                                   .count();
+        const long sleep_ms =
+            static_cast<long>(band_ms * (1.0 - gpu_duty) / gpu_duty);
+        if (sleep_ms > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        }
+      }
+    }
+  };
 
   for (int iter = 0; iter < options_.num_iterations; ++iter) {
     Timer iter_timer;
@@ -979,81 +1055,103 @@ void PatchMatchOpenCL::RunSweeps() {
       const int filter_geom =
           (last_sweep && options_.filter && options_.geom_consistency) ? 1 : 0;
 
+      const int W = cur_width_;
+      const int H = cur_height_;
+
       if (filter_photo) {
         const uint8_t zero = 0;
         CheckCL(clEnqueueFillBuffer(
                     queue_, cmask_buf_, &zero, sizeof(uint8_t), 0,
-                    static_cast<size_t>(num_src_) * cur_width_ * cur_height_ *
-                        sizeof(uint8_t),
+                    static_cast<size_t>(num_src_) * W * H * sizeof(uint8_t),
                     0, nullptr, nullptr),
                 "clEnqueueFillBuffer(cmask)");
       }
 
-      // Set sweep kernel args.
-      cl_uint a = 0;
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &depth_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &normal_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &ref_img_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &ref_sum_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &ref_sqsum_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &src_images_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &poses_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &ref_inv_K_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &bilateral_spatial_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &bilateral_color_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &rand_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &sel_prob_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &prev_sel_prob_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &cost_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &cmask_buf_);
-      SetArg(k_sweep_, a++, sizeof(int), &cur_width_);
-      SetArg(k_sweep_, a++, sizeof(int), &cur_height_);
-      SetArg(k_sweep_, a++, sizeof(int), &num_src_);
-      SetArg(k_sweep_, a++, sizeof(int), &src_max_w_);
-      SetArg(k_sweep_, a++, sizeof(int), &src_max_h_);
-      SetArg(k_sweep_, a++, sizeof(int), &window_radius_);
-      SetArg(k_sweep_, a++, sizeof(int), &window_step_);
-      SetArg(k_sweep_, a++, sizeof(int), &rotation_);
-      SetArg(k_sweep_, a++, sizeof(int), &num_samples);
-      SetArg(k_sweep_, a++, sizeof(float), &perturbation);
-      SetArg(k_sweep_, a++, sizeof(float), &prev_sel_prob_weight);
-      SetArg(k_sweep_, a++, sizeof(float), &inv_ncc_sigma_sq);
-      SetArg(k_sweep_, a++, sizeof(float), &ncc_norm_factor);
-      SetArg(k_sweep_, a++, sizeof(float), &cos_min_tri);
-      SetArg(k_sweep_, a++, sizeof(float), &inv_inc_sigma_sq);
-      SetArg(k_sweep_, a++, sizeof(int), &filter_photo);
-      SetArg(k_sweep_, a++, sizeof(float), &filter_min_ncc_prob);
-      SetArg(k_sweep_, a++, sizeof(float), &filter_cos_min_tri);
-      SetArg(k_sweep_, a++, sizeof(int), &filter_min_num_consistent);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &src_depth_buf_);
-      SetArg(k_sweep_, a++, sizeof(cl_mem), &ref_K_buf_);
-      SetArg(k_sweep_, a++, sizeof(int), &geom_consistency_term);
-      SetArg(k_sweep_, a++, sizeof(float), &geom_regularizer);
-      SetArg(k_sweep_, a++, sizeof(float), &geom_max_cost);
-      SetArg(k_sweep_, a++, sizeof(int), &filter_geom);
-      SetArg(k_sweep_, a++, sizeof(float), &filter_geom_max_cost);
+      //////////////////////////////////////////////////////////////////////////
+      // Backward message pass: write the whole column's betas into
+      // sel_prob_map. Chunked high->low; must fully complete (every chunk, every
+      // column) before the forward pass reads the betas.
+      //////////////////////////////////////////////////////////////////////////
+      {
+        cl_uint a = 0;
+        SetArg(k_sweep_bwd_, a++, sizeof(cl_mem), &cost_buf_);
+        SetArg(k_sweep_bwd_, a++, sizeof(cl_mem), &sel_prob_buf_);
+        SetArg(k_sweep_bwd_, a++, sizeof(int), &cur_width_);
+        SetArg(k_sweep_bwd_, a++, sizeof(int), &cur_height_);
+        SetArg(k_sweep_bwd_, a++, sizeof(int), &num_src_);
+        SetArg(k_sweep_bwd_, a++, sizeof(float), &inv_ncc_sigma_sq);
+        SetArg(k_sweep_bwd_, a++, sizeof(float), &ncc_norm_factor);
+        const cl_uint bwd_row_begin = a++;
+        const cl_uint bwd_row_end = a++;
+        for (int r_hi = H - 1; r_hi >= 0; r_hi -= chunk_rows) {
+          const int row_begin = std::max(0, r_hi - chunk_rows + 1);
+          const int row_end = r_hi + 1;
+          SetArg(k_sweep_bwd_, bwd_row_begin, sizeof(int), &row_begin);
+          SetArg(k_sweep_bwd_, bwd_row_end, sizeof(int), &row_end);
+          dispatch_banded(k_sweep_bwd_, W,
+                          "clEnqueueNDRangeKernel(sweep_backward)");
+        }
+      }
 
-      // Column-banded launches: short dispatches plus a duty-cycle sleep keep
-      // the desktop responsive and stay under the Windows TDR watchdog.
-      for (int c0 = 0; c0 < cur_width_; c0 += sweep_band) {
-        const auto band_start = std::chrono::steady_clock::now();
-        const size_t offset = static_cast<size_t>(c0);
-        const size_t gsize =
-            static_cast<size_t>(std::min(sweep_band, cur_width_ - c0));
-        CheckCL(clEnqueueNDRangeKernel(queue_, k_sweep_, 1, &offset, &gsize,
-                                       nullptr, 0, nullptr, nullptr),
-                "clEnqueueNDRangeKernel(sweep)");
-        CheckCL(clFinish(queue_), "clFinish(sweep band)");
-        if (gpu_duty < 1.0f) {
-          const double band_ms =
-              std::chrono::duration<double, std::milli>(
-                  std::chrono::steady_clock::now() - band_start)
-                  .count();
-          const long sleep_ms =
-              static_cast<long>(band_ms * (1.0 - gpu_duty) / gpu_duty);
-          if (sleep_ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-          }
+      //////////////////////////////////////////////////////////////////////////
+      // Forward sweep: chunked low->high, persisting per-column state between
+      // chunks. Set the (mostly constant) args once, vary only the row range.
+      //////////////////////////////////////////////////////////////////////////
+      {
+        cl_uint a = 0;
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &depth_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &normal_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &ref_img_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &ref_sum_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &ref_sqsum_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &src_images_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &poses_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &ref_inv_K_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &bilateral_spatial_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &bilateral_color_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &rand_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &sel_prob_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &prev_sel_prob_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &cost_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &cmask_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &cur_width_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &cur_height_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &num_src_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &src_max_w_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &src_max_h_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &window_radius_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &window_step_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &rotation_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &num_samples);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &perturbation);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &prev_sel_prob_weight);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &inv_ncc_sigma_sq);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &ncc_norm_factor);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &cos_min_tri);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &inv_inc_sigma_sq);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &filter_photo);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &filter_min_ncc_prob);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &filter_cos_min_tri);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &filter_min_num_consistent);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &src_depth_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &ref_K_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &geom_consistency_term);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &geom_regularizer);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &geom_max_cost);
+        SetArg(k_sweep_fwd_, a++, sizeof(int), &filter_geom);
+        SetArg(k_sweep_fwd_, a++, sizeof(float), &filter_geom_max_cost);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &fwd_prev_depth_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &fwd_prev_normal_buf_);
+        SetArg(k_sweep_fwd_, a++, sizeof(cl_mem), &fwd_message_buf_);
+        const cl_uint fwd_row_begin = a++;
+        const cl_uint fwd_row_end = a++;
+        for (int r_lo = 0; r_lo < H; r_lo += chunk_rows) {
+          const int row_begin = r_lo;
+          const int row_end = std::min(H, r_lo + chunk_rows);
+          SetArg(k_sweep_fwd_, fwd_row_begin, sizeof(int), &row_begin);
+          SetArg(k_sweep_fwd_, fwd_row_end, sizeof(int), &row_end);
+          dispatch_banded(k_sweep_fwd_, W,
+                          "clEnqueueNDRangeKernel(sweep_forward)");
         }
       }
 
