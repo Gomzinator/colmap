@@ -79,12 +79,11 @@ constexpr float kInvMaxIntensity = 1.0f / 255.0f;
 // annoying (costs speed). Override with COLMAP_OPENCL_SWEEP_BAND. Also keeps
 // each dispatch below the Windows TDR watchdog.
 constexpr int kDefaultSweepColumnBand = 48;
-// Default GPU duty-cycle. Vanilla behavior is full speed (1.0 = GPU ~100%, like
-// the CUDA backend); throttling is opt-in. Set COLMAP_OPENCL_DUTY < 1 (e.g. 0.5
-// from a launch script) to make the host sleep band_ms*(1-duty)/duty after each
-// sweep band, leaving the shared Adreno idle ~(1-duty) of the time so the
-// desktop stays responsive.
-constexpr float kDefaultGpuDuty = 1.0f;
+// GPU duty-cycle source: the PatchMatchStereo.gpu_duty option (default 1.0 =
+// full speed, like CUDA). Values < 1 make the host sleep band_ms*(1-duty)/duty
+// after each sweep band, leaving the shared Adreno (the display GPU) idle
+// ~(1-duty) of the time so the desktop stays responsive. The COLMAP_OPENCL_DUTY
+// env var, when set, overrides the option (back-compat with the run scripts).
 // Default per-work-item (per-column) work budget for ONE forward-sweep dispatch,
 // in photo-cost window-samples. The Adreno silently garbages a sweep work-item
 // above ~1.5M such samples per column (see OPENCL_LARGE_IMAGE_BUG.md); we chunk
@@ -959,7 +958,8 @@ void PatchMatchOpenCL::RunSweeps() {
   // GPU throttling so the shared Adreno does not starve the desktop.
   const int sweep_band =
       EnvInt("COLMAP_OPENCL_SWEEP_BAND", kDefaultSweepColumnBand);
-  const float gpu_duty = EnvFloat("COLMAP_OPENCL_DUTY", kDefaultGpuDuty);
+  const float gpu_duty =
+      EnvFloat("COLMAP_OPENCL_DUTY", static_cast<float>(options_.gpu_duty));
 
   // Row-chunking: bound per-work-item (per-column) work per dispatch. Each
   // sweep work-item processes a full image column; above ~1.5M photo-cost

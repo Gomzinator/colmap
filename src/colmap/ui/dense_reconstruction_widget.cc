@@ -58,6 +58,41 @@ class StereoOptionsTab : public OptionsWidget {
       options->patch_match_stereo->max_image_size = 2000;
     }
 
+    // --- Dense compute backend (this CUDA-less native-ARM64 build) ----------
+    // One dropdown maps to (backend, gpu_duty). CPU is the default and is by far
+    // the fastest here; the 3-CU Adreno GPU (OpenCL) path is much slower and is
+    // mainly useful to offload work off the CPU. The throttled choice keeps the
+    // desktop responsive (the Adreno is also the display GPU). The selection is
+    // written into the options live, so the next Stereo run uses it.
+    mvs::PatchMatchOptions* pm = options->patch_match_stereo.get();
+    QComboBox* backend_combo = new QComboBox(this);
+    backend_combo->addItem(tr("CPU (fastest here)"));                  // 0
+    backend_combo->addItem(tr("OpenCL GPU - full speed (duty 1.0)"));  // 1
+    backend_combo->addItem(tr("OpenCL GPU - throttled (duty 0.7)"));   // 2
+    int backend_init_idx = 0;
+    if (pm->backend == "opencl") {
+      backend_init_idx = (pm->gpu_duty <= 0.85) ? 2 : 1;
+    }
+    backend_combo->setCurrentIndex(backend_init_idx);
+    auto apply_backend = [pm](int idx) {
+      if (idx == 1) {
+        pm->backend = "opencl";
+        pm->gpu_duty = 1.0;
+      } else if (idx == 2) {
+        pm->backend = "opencl";
+        pm->gpu_duty = 0.7;
+      } else {
+        pm->backend = "cpu";
+        pm->gpu_duty = 1.0;
+      }
+    };
+    apply_backend(backend_init_idx);  // reflect the shown choice immediately
+    connect(backend_combo,
+            &QComboBox::currentIndexChanged,
+            this,
+            [apply_backend](int idx) { apply_backend(idx); });
+    AddWidgetRow("compute_backend", backend_combo);
+
     AddOptionInt(
         &options->patch_match_stereo->max_image_size, "max_image_size", -1);
     AddOptionText(&options->patch_match_stereo->gpu_index, "gpu_index");

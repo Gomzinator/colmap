@@ -37,8 +37,15 @@ namespace mvs {
 struct PatchMatchOptions {
   // Compute backend: "auto" selects CUDA if compiled in and a device is
   // available, otherwise falls back to the (much slower) CPU backend.
-  // "cuda" and "cpu" force the respective backend.
+  // "cuda", "cpu" and "opencl" force the respective backend.
   std::string backend = "auto";
+
+  // OpenCL backend only: GPU duty cycle in (0, 1]. On the Adreno (which is also
+  // the display GPU) 1.0 = full speed; values < 1.0 idle the GPU ~(1 - duty) of
+  // the time after each sweep band so the desktop stays responsive. Ignored by
+  // the CUDA/CPU backends. The COLMAP_OPENCL_DUTY env var, when set, overrides
+  // this (back-compat with the research run scripts).
+  double gpu_duty = 1.0;
 
   // Depth range in which to randomly sample depth hypotheses.
   double depth_min = -1.0f;
